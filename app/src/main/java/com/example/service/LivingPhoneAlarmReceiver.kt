@@ -5,6 +5,10 @@ import android.content.Context
 import android.content.Intent
 import android.os.PowerManager
 import android.util.Log
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeout
 
 class LivingPhoneAlarmReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
@@ -17,19 +21,32 @@ class LivingPhoneAlarmReceiver : BroadcastReceiver() {
             "LivingPhone:AlarmWakeLock"
         )
 
-        try {
-            wakeLock?.acquire(6000L) // Safe 6s wake lock while evaluating audio clip
+        val pendingResult = goAsync()
 
-            val targetHour = if (scheduledHour in 0..4) scheduledHour else null
-            ReactionController.getInstance(context).onLateNightCheck(targetHour)
-            AlarmScheduler.scheduleNextLateNightAlarm(context)
-        } catch (e: Exception) {
-            Log.e("LivingPhone_Alarm", "Error handling alarm: ${e.message}")
-        } finally {
-            if (wakeLock?.isHeld == true) {
-                try {
-                    wakeLock.release()
-                } catch (_: Exception) {}
+        CoroutineScope(Dispatchers.IO).launch {
+            try {
+                // Hold wake lock for the duration of critical late-night evaluation and playback
+                wakeLock?.acquire(15000L)
+
+                withTimeout(12000L) {
+                    val targetHour = if (scheduledHour in 0..4) scheduledHour else null
+                    val controller = ReactionController.getInstance(context)
+
+                    // Synchronously processes alarm: stale check, deduplication, DataStore persistence & audio playback
+                    controller.processLateNightAlarm(targetHour)
+
+                    // Reschedule the next late-night alarm
+                    AlarmScheduler.scheduleNextLateNightAlarm(context)
+                }
+            } catch (e: Exception) {
+                Log.e("LivingPhone_Alarm", "Error handling late night alarm async execution: ${e.message}")
+            } finally {
+                if (wakeLock?.isHeld == true) {
+                    try {
+                        wakeLock.release()
+                    } catch (_: Exception) {}
+                }
+                pendingResult.finish()
             }
         }
     }

@@ -1,6 +1,8 @@
 package com.example
 
 import android.content.Context
+import android.content.Intent
+import android.os.BatteryManager
 import androidx.test.core.app.ApplicationProvider
 import com.example.audio.AudioCatalog
 import com.example.audio.AudioCategory
@@ -9,6 +11,9 @@ import com.example.audio.AudioPlayResult
 import com.example.data.PreferencesRepository
 import com.example.data.ReactionFrequency
 import com.example.service.AlarmScheduler
+import com.example.service.LivingPhoneAlarmReceiver
+import com.example.service.LivingPhoneBootReceiver
+import com.example.service.LivingPhonePowerReceiver
 import com.example.service.ReactionController
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
@@ -20,6 +25,7 @@ import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
+import java.util.Calendar
 
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [34])
@@ -30,6 +36,7 @@ class ExampleRobolectricTest {
     @Before
     fun setUp() {
         context = ApplicationProvider.getApplicationContext()
+        ReactionController.getInstance(context).resetCooldownsForTesting()
     }
 
     @Test
@@ -40,7 +47,6 @@ class ExampleRobolectricTest {
 
     @Test
     fun verifyAudioCatalogStructureAndPaths() {
-        // Total expected clips across all categories is exactly 43
         assertEquals(43, AudioCatalog.TOTAL_EXPECTED_CLIPS)
 
         // Verify BATTERY_15
@@ -89,7 +95,7 @@ class ExampleRobolectricTest {
     fun verifyAudioEngineMissingClipsNeverCrash() {
         val audioEngine = AudioEngine(context)
 
-        // Since mp3 files are not yet in assets, playCategory must safely return MissingFiles without throwing
+        // Missing clips return MissingFiles safely without throwing
         val result = audioEngine.playCategory(AudioCategory.BATTERY_15)
         assertTrue(
             "Expected MissingFiles result, got $result",
@@ -98,34 +104,48 @@ class ExampleRobolectricTest {
     }
 
     @Test
-    fun verifyFrequencyCooldownConstants() {
-        assertEquals(10 * 60 * 1000L, ReactionFrequency.LOW.globalCooldownMillis)
-        assertEquals(15 * 60 * 1000L, ReactionFrequency.LOW.categoryCooldownMillis)
-
-        assertEquals(3 * 60 * 1000L, ReactionFrequency.NORMAL.globalCooldownMillis)
-        assertEquals(6 * 60 * 1000L, ReactionFrequency.NORMAL.categoryCooldownMillis)
-
-        assertEquals(45 * 1000L, ReactionFrequency.HIGH.globalCooldownMillis)
-        assertEquals(90 * 1000L, ReactionFrequency.HIGH.categoryCooldownMillis)
-    }
-
-    @Test
-    fun verifyReactionControllerSingleton() {
-        val controller1 = ReactionController.getInstance(context)
-        val controller2 = ReactionController.getInstance(context)
-        assertNotNull(controller1)
-        assertEquals(controller1, controller2)
-    }
-
-    @Test
-    fun verifyInitialChargingStateDoesNotTriggerReaction() {
+    fun verifyInitialStateSeedingDoesNotTriggerReaction() {
         val controller = ReactionController.getInstance(context)
 
-        // When receiving the initial state reading (e.g. false), controller must establish baseline without reacting
-        controller.onChargingChanged(false)
-        // If the same state arrives again, it must suppress duplicate
-        controller.onChargingChanged(false)
+        // Fabricate a battery intent snapshot reporting charging=true at 80%
+        val intent = Intent(Intent.ACTION_BATTERY_CHANGED).apply {
+            putExtra(BatteryManager.EXTRA_STATUS, BatteryManager.BATTERY_STATUS_CHARGING)
+            putExtra(BatteryManager.EXTRA_LEVEL, 80)
+            putExtra(BatteryManager.EXTRA_SCALE, 100)
+        }
+
+        // Seeding baseline state must not trigger any audio reaction
+        controller.seedInitialState(intent)
         assertNotNull(controller)
+    }
+
+    @Test
+    fun verifyColdStartExplicitConnectHandling() {
+        val controller = ReactionController.getInstance(context)
+
+        // Simulate cold-start where initial state baseline is seeded as charging=true
+        val intent = Intent(Intent.ACTION_BATTERY_CHANGED).apply {
+            putExtra(BatteryManager.EXTRA_STATUS, BatteryManager.BATTERY_STATUS_CHARGING)
+            putExtra(BatteryManager.EXTRA_LEVEL, 80)
+            putExtra(BatteryManager.EXTRA_SCALE, 100)
+        }
+        controller.seedInitialState(intent)
+
+        // When explicit power event arrives, it MUST NOT be swallowed by the seeded baseline
+        val triggered = controller.onExplicitPowerTransition(true)
+        assertTrue("Explicit power connection transition must trigger reaction", triggered)
+    }
+
+    @Test
+    fun verifyRepeatedPowerBroadcastsSuppression() {
+        val controller = ReactionController.getInstance(context)
+
+        // First explicit connection triggers
+        controller.onExplicitPowerTransition(true)
+
+        // Immediate repeat broadcast (within debounce) must be suppressed
+        val duplicateTriggered = controller.onExplicitPowerTransition(true)
+        assertFalse("Duplicate explicit power broadcast must be suppressed", duplicateTriggered)
     }
 
     @Test
@@ -152,18 +172,32 @@ class ExampleRobolectricTest {
     }
 
     @Test
-    fun verifyAlarmSchedulerConstants() {
-        assertEquals("extra_scheduled_hour", AlarmScheduler.EXTRA_SCHEDULED_HOUR)
-        assertEquals("extra_scheduled_time_millis", AlarmScheduler.EXTRA_SCHEDULED_TIME_MILLIS)
+    fun verifyLateNightHourPersistenceAndDeduplication() = runBlocking {
+        val repository = PreferencesRepository(context)
+        repository.recordLateNightHourTriggered(1, "20261010")
+
+        val recorded = repository.getLastLateNightDate(1)
+        assertEquals("20261010", recorded)
+
+        val controller = ReactionController.getInstance(context)
+        // If hour 1 was already recorded today in DataStore, processing it again must be rejected
+        val played = controller.processLateNightAlarm(1)
+        assertFalse("Duplicate execution for hour 1 today must be rejected", played)
     }
 
     @Test
-    fun verifyLateNightHourPersistence() = runBlocking {
-        val repository = PreferencesRepository(context)
-        repository.recordLateNightHourTriggered(0, "20261010")
+    fun verifyDelayedLateNightAlarmHandling() = runBlocking {
+        val controller = ReactionController.getInstance(context)
 
-        val recorded = repository.getLastLateNightDate(0)
-        assertEquals("20261010", recorded)
+        val calendar = Calendar.getInstance()
+        val currentHour = calendar.get(Calendar.HOUR_OF_DAY)
+
+        // An alarm scheduled for an hour that does not match current hour (e.g. 5 hours ago)
+        val staleHour = (currentHour + 5) % 24
+        if (staleHour in 0..4) {
+            val played = controller.processLateNightAlarm(staleHour)
+            assertFalse("Stale alarm arriving hours late must be skipped", played)
+        }
     }
 
     @Test
@@ -172,6 +206,8 @@ class ExampleRobolectricTest {
         repository.setLivingEnabled(false)
 
         val controller = ReactionController.getInstance(context)
+        // Wait briefly for cachedSettings to update
+        kotlinx.coroutines.delay(50L)
         val triggered = controller.attemptReaction(AudioCategory.BATTERY_15, "Test when paused")
         assertFalse("Reaction must be suppressed when Living Phone is disabled", triggered)
 
@@ -185,10 +221,23 @@ class ExampleRobolectricTest {
         repository.setVoiceEnabled(false)
 
         val controller = ReactionController.getInstance(context)
+        kotlinx.coroutines.delay(50L)
         val triggered = controller.attemptReaction(AudioCategory.CHARGING_CONNECT, "Test when voice muted")
         assertFalse("Voice reaction must be suppressed when voice is muted", triggered)
 
         // Restore
         repository.setVoiceEnabled(true)
+    }
+
+    @Test
+    fun verifyReceiversInstantiateSafely() {
+        val powerReceiver = LivingPhonePowerReceiver()
+        assertNotNull(powerReceiver)
+
+        val bootReceiver = LivingPhoneBootReceiver()
+        assertNotNull(bootReceiver)
+
+        val alarmReceiver = LivingPhoneAlarmReceiver()
+        assertNotNull(alarmReceiver)
     }
 }

@@ -20,6 +20,8 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import java.text.SimpleDateFormat
 import java.util.Calendar
 import java.util.Date
@@ -39,6 +41,10 @@ class ReactionController private constructor(private val context: Context) {
     val preferencesRepository = PreferencesRepository(context)
     val audioEngine = AudioEngine(context)
 
+    // Cached settings kept in sync with DataStore
+    @Volatile
+    private var cachedSettings = LivingSettings()
+
     // Cooldown tracking in memory (fast checks)
     private var lastGlobalTriggerTime: Long = 0L
     private val lastCategoryTriggerTimes = ConcurrentHashMap<String, Long>()
@@ -48,8 +54,14 @@ class ReactionController private constructor(private val context: Context) {
     private var isBattery15Triggered = false
     private var isBattery100Triggered = false
 
-    private var lastChargingConnected: Boolean? = null
-    private var lastChargingStateTime: Long = 0L
+    // Charging state tracking
+    private var lastKnownChargingConnected: Boolean? = null
+    private var lastExplicitPowerState: Boolean? = null
+    private var lastExplicitPowerTimestamp: Long = 0L
+
+    // Late-night memory cache to prevent duplicate triggers if receiver runs multiple times
+    private val lateNightProcessedToday = ConcurrentHashMap<String, Boolean>()
+    private val lateNightMutex = Mutex()
 
     private val _latestReaction = MutableStateFlow<ReactionFeedback?>(null)
     val latestReaction: StateFlow<ReactionFeedback?> = _latestReaction.asStateFlow()
@@ -58,33 +70,23 @@ class ReactionController private constructor(private val context: Context) {
     val isReacting: StateFlow<Boolean> = _isReacting.asStateFlow()
 
     init {
-        initializeBatteryAndPowerState()
+        scope.launch {
+            preferencesRepository.settingsFlow.collect { settings ->
+                cachedSettings = settings
+            }
+        }
+        initializeBatteryAndPowerBaseline()
     }
 
     /**
-     * Initializes initial physical state from the system's sticky battery broadcast
-     * so that app startup does NOT fabricate false charging or battery reactions.
+     * Initializes physical state baseline from sticky battery broadcast.
+     * This establishes the baseline for passive monitoring without fabricating events.
      */
-    private fun initializeBatteryAndPowerState() {
+    private fun initializeBatteryAndPowerBaseline() {
         try {
             val stickyIntent = context.registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
             if (stickyIntent != null) {
-                val status = stickyIntent.getIntExtra(BatteryManager.EXTRA_STATUS, -1)
-                val isCharging = status == BatteryManager.BATTERY_STATUS_CHARGING ||
-                        status == BatteryManager.BATTERY_STATUS_FULL
-                lastChargingConnected = isCharging
-                lastChargingStateTime = System.currentTimeMillis()
-
-                val level = stickyIntent.getIntExtra(BatteryManager.EXTRA_LEVEL, -1)
-                val scale = stickyIntent.getIntExtra(BatteryManager.EXTRA_SCALE, -1)
-                if (level >= 0 && scale > 0) {
-                    val pct = (level * 100) / scale
-                    lastBatteryLevel = pct
-                    // Seed threshold state without triggering reactions
-                    if (pct <= 15) isBattery15Triggered = true
-                    if (pct >= 100) isBattery100Triggered = true
-                }
-                Log.d(tag, "Initial power state baseline set: charging=$isCharging, level=$lastBatteryLevel%")
+                seedInitialState(stickyIntent)
             }
         } catch (e: Exception) {
             Log.w(tag, "Failed to read initial sticky battery intent: ${e.message}")
@@ -92,47 +94,90 @@ class ReactionController private constructor(private val context: Context) {
     }
 
     /**
-     * Attempts to trigger a reaction for a given category.
-     * Evaluates master switch, voice switch, cooldowns, and deduplication.
+     * Seeds initial battery and charging state baseline without triggering audio reactions.
      */
-    fun attemptReaction(category: AudioCategory, reason: String = ""): Boolean {
-        var triggered = false
-        scope.launch {
-            val settings = preferencesRepository.settingsFlow.first()
-            if (!settings.isLivingPhoneEnabled) {
-                Log.d(tag, "Reaction suppressed: Living Phone is Paused.")
-                return@launch
-            }
+    fun seedInitialState(batteryIntent: Intent) {
+        val status = batteryIntent.getIntExtra(BatteryManager.EXTRA_STATUS, -1)
+        val isCharging = status == BatteryManager.BATTERY_STATUS_CHARGING ||
+                status == BatteryManager.BATTERY_STATUS_FULL
+        lastKnownChargingConnected = isCharging
 
-            if (!settings.isVoiceEnabled) {
-                Log.d(tag, "Voice reactions are disabled by user.")
-                return@launch
-            }
-
-            val now = System.currentTimeMillis()
-
-            // 1. Check Global Cooldown
-            val globalCooldown = settings.frequency.globalCooldownMillis
-            if (now - lastGlobalTriggerTime < globalCooldown) {
-                val remainingSec = (globalCooldown - (now - lastGlobalTriggerTime)) / 1000
-                Log.d(tag, "Reaction suppressed: Global cooldown active ($remainingSec s remaining). Reason: $reason")
-                return@launch
-            }
-
-            // 2. Check Category Cooldown
-            val categoryCooldown = settings.frequency.categoryCooldownMillis
-            val lastCatTime = lastCategoryTriggerTimes[category.id] ?: 0L
-            if (now - lastCatTime < categoryCooldown) {
-                val remainingSec = (categoryCooldown - (now - lastCatTime)) / 1000
-                Log.d(tag, "Reaction suppressed: Category cooldown for ${category.id} ($remainingSec s remaining). Reason: $reason")
-                return@launch
-            }
-
-            // Execute Reaction
-            executeReactionInternal(category, settings)
-            triggered = true
+        val level = batteryIntent.getIntExtra(BatteryManager.EXTRA_LEVEL, -1)
+        val scale = batteryIntent.getIntExtra(BatteryManager.EXTRA_SCALE, -1)
+        if (level >= 0 && scale > 0) {
+            val pct = (level * 100) / scale
+            lastBatteryLevel = pct
+            // Seed threshold state without triggering reactions
+            if (pct <= 15) isBattery15Triggered = true
+            if (pct >= 100) isBattery100Triggered = true
         }
-        return triggered
+        Log.d(tag, "Initial power baseline seeded: charging=$isCharging, level=$lastBatteryLevel%")
+    }
+
+    /**
+     * Explicit system power-transition event from ACTION_POWER_CONNECTED or ACTION_POWER_DISCONNECTED.
+     * Unlike background snapshots, this represents a genuine hardware cable transition.
+     * It is never swallowed by initial sticky state seeding during process cold starts.
+     */
+    fun onExplicitPowerTransition(isConnected: Boolean): Boolean {
+        val now = System.currentTimeMillis()
+
+        // Deduplicate rapid repeat broadcasts (e.g., within 3 seconds) for the same state
+        if (lastExplicitPowerState == isConnected && (now - lastExplicitPowerTimestamp < 3000L)) {
+            Log.d(tag, "Explicit power event duplicate suppressed (within 3s): isConnected=$isConnected")
+            return false
+        }
+
+        lastExplicitPowerState = isConnected
+        lastExplicitPowerTimestamp = now
+        lastKnownChargingConnected = isConnected
+
+        return if (isConnected) {
+            Log.i(tag, "Genuine Charger Connected explicit transition")
+            attemptReaction(AudioCategory.CHARGING_CONNECT, "Power Cable Connected")
+        } else {
+            Log.i(tag, "Genuine Charger Disconnected explicit transition")
+            attemptReaction(AudioCategory.CHARGING_DISCONNECT, "Power Cable Disconnected")
+        }
+    }
+
+    /**
+     * Passive charging state changes observed from ACTION_BATTERY_CHANGED in running service.
+     * Prevents duplicate reactions if an explicit power transition was already processed recently.
+     */
+    fun onChargingChanged(isConnected: Boolean) {
+        val now = System.currentTimeMillis()
+
+        // 1. If uninitialized, establish baseline state without fabricating an event
+        if (lastKnownChargingConnected == null) {
+            lastKnownChargingConnected = isConnected
+            Log.d(tag, "Charging baseline initialized from snapshot: isConnected=$isConnected (no audio)")
+            return
+        }
+
+        // 2. If state hasn't changed, ignore snapshot
+        if (lastKnownChargingConnected == isConnected) {
+            return
+        }
+
+        // 3. If an explicit power event for this state was handled within the last 4 seconds, suppress duplicate
+        if (lastExplicitPowerState == isConnected && (now - lastExplicitPowerTimestamp < 4000L)) {
+            lastKnownChargingConnected = isConnected
+            return
+        }
+
+        // 4. Genuine state change observed via battery broadcast
+        lastKnownChargingConnected = isConnected
+        lastExplicitPowerState = isConnected
+        lastExplicitPowerTimestamp = now
+
+        if (isConnected) {
+            Log.i(tag, "Charger Connected observed via battery status")
+            attemptReaction(AudioCategory.CHARGING_CONNECT, "Power Status Connected")
+        } else {
+            Log.i(tag, "Charger Disconnected observed via battery status")
+            attemptReaction(AudioCategory.CHARGING_DISCONNECT, "Power Status Disconnected")
+        }
     }
 
     /**
@@ -178,62 +223,23 @@ class ReactionController private constructor(private val context: Context) {
     }
 
     /**
-     * Handles charging connected / disconnected state transitions.
-     * Prevents false triggers on initialization or repeated broadcasts.
+     * Asynchronously and reliably processes a late-night hourly alarm.
+     * Validates delay constraints, checks DataStore persistence, and prevents duplicate playback.
+     * Returns true if a clip was played, false otherwise.
      */
-    fun onChargingChanged(isConnected: Boolean) {
-        val now = System.currentTimeMillis()
-
-        // 1. If uninitialized, establish baseline state without fabricating an event
-        if (lastChargingConnected == null) {
-            lastChargingConnected = isConnected
-            lastChargingStateTime = now
-            Log.d(tag, "Initial charging baseline established: isConnected=$isConnected (no audio)")
-            return
-        }
-
-        // 2. If state hasn't genuinely changed, ignore broadcast snapshot
-        if (lastChargingConnected == isConnected) {
-            return
-        }
-
-        // 3. Debounce rapid physical connection jitter (at least 2.5s between transitions)
-        if (now - lastChargingStateTime < 2500L) {
-            Log.d(tag, "Charging state jitter ignored (${now - lastChargingStateTime}ms)")
-            return
-        }
-
-        lastChargingConnected = isConnected
-        lastChargingStateTime = now
-
-        if (isConnected) {
-            Log.i(tag, "Genuine Charger Connected transition detected")
-            attemptReaction(AudioCategory.CHARGING_CONNECT, "Power Connected")
-        } else {
-            Log.i(tag, "Genuine Charger Disconnected transition detected")
-            attemptReaction(AudioCategory.CHARGING_DISCONNECT, "Power Disconnected")
-        }
-    }
-
-    /**
-     * Evaluates late night reactions (Midnight, 1, 2, 3, 4 AM).
-     * Compares scheduled hour with actual clock time to reject delayed/stale alarms deterministically.
-     * Persists triggered calendar dates so reactions do not repeat within the same calendar day.
-     */
-    fun onLateNightCheck(scheduledHour: Int? = null) {
+    suspend fun processLateNightAlarm(scheduledHour: Int?): Boolean = lateNightMutex.withLock {
         val calendar = Calendar.getInstance()
         val currentHour = calendar.get(Calendar.HOUR_OF_DAY)
         val currentMinute = calendar.get(Calendar.MINUTE)
         val todayStr = SimpleDateFormat("yyyyMMdd", Locale.US).format(Date())
 
-        // Target hour determination
         val targetHour = scheduledHour ?: currentHour
 
         // Deterministic delay check: if alarm fired more than 20 minutes after target hour started, skip it
         if (scheduledHour != null) {
             if (currentHour != scheduledHour || currentMinute > 20) {
                 Log.w(tag, "Late night alarm for hour $scheduledHour arrived late (now $currentHour:$currentMinute). Skipping stale clip.")
-                return
+                return false
             }
         }
 
@@ -244,23 +250,42 @@ class ReactionController private constructor(private val context: Context) {
             3 -> AudioCategory.LATE_NIGHT_3AM
             4 -> AudioCategory.LATE_NIGHT_4AM
             else -> null
+        } ?: return false
+
+        // Check in-memory guard for duplicate invocations
+        val memoryKey = "${todayStr}_$targetHour"
+        if (lateNightProcessedToday[memoryKey] == true) {
+            Log.d(tag, "Late night hour $targetHour already executed in memory today. Suppressing duplicate.")
+            return false
         }
 
-        if (targetCategory == null) return
+        // Check persistent store to guarantee no duplicate trigger today across process restarts
+        val lastRecordedDate = preferencesRepository.getLastLateNightDate(targetHour)
+        if (lastRecordedDate == todayStr) {
+            Log.d(tag, "Late night hour $targetHour already recorded in DataStore today ($todayStr). Suppressing duplicate.")
+            return false
+        }
 
+        val settings = preferencesRepository.settingsFlow.first()
+        cachedSettings = settings
+        if (!settings.isLivingPhoneEnabled || !settings.isVoiceEnabled) {
+            Log.d(tag, "Late night reaction suppressed: livingPhoneEnabled=${settings.isLivingPhoneEnabled}, voiceEnabled=${settings.isVoiceEnabled}")
+            return false
+        }
+
+        lateNightProcessedToday[memoryKey] = true
+        preferencesRepository.recordLateNightHourTriggered(targetHour, todayStr)
+
+        executeReactionInternal(targetCategory, settings)
+        return true
+    }
+
+    /**
+     * Non-suspending bridge for late-night check.
+     */
+    fun onLateNightCheck(scheduledHour: Int? = null) {
         scope.launch {
-            // Check persistent store to guarantee no duplicate trigger today across process restarts
-            val lastRecordedDate = preferencesRepository.getLastLateNightDate(targetHour)
-            if (lastRecordedDate == todayStr) {
-                Log.d(tag, "Late night hour $targetHour already triggered today ($todayStr). Suppressing duplicate.")
-                return@launch
-            }
-
-            val settings = preferencesRepository.settingsFlow.first()
-            if (!settings.isLivingPhoneEnabled || !settings.isVoiceEnabled) return@launch
-
-            preferencesRepository.recordLateNightHourTriggered(targetHour, todayStr)
-            executeReactionInternal(targetCategory, settings)
+            processLateNightAlarm(scheduledHour)
         }
     }
 
@@ -270,6 +295,53 @@ class ReactionController private constructor(private val context: Context) {
      */
     fun onUserPresent() {
         attemptReaction(AudioCategory.USAGE, "Device Unlocked / Active Usage")
+    }
+
+    /**
+     * Attempts to trigger a reaction for a given category.
+     * Synchronously evaluates master switch, voice switch, and cooldowns.
+     * Returns true if accepted and dispatched, false if suppressed by pause/mute/cooldown.
+     */
+    fun attemptReaction(category: AudioCategory, reason: String = ""): Boolean {
+        val settings = cachedSettings
+        if (!settings.isLivingPhoneEnabled) {
+            Log.d(tag, "Reaction suppressed: Living Phone is Paused.")
+            return false
+        }
+
+        if (!settings.isVoiceEnabled) {
+            Log.d(tag, "Voice reactions are disabled by user.")
+            return false
+        }
+
+        val now = System.currentTimeMillis()
+
+        // 1. Check Global Cooldown
+        val globalCooldown = settings.frequency.globalCooldownMillis
+        if (now - lastGlobalTriggerTime < globalCooldown) {
+            val remainingSec = (globalCooldown - (now - lastGlobalTriggerTime)) / 1000
+            Log.d(tag, "Reaction suppressed: Global cooldown active ($remainingSec s remaining). Reason: $reason")
+            return false
+        }
+
+        // 2. Check Category Cooldown
+        val categoryCooldown = settings.frequency.categoryCooldownMillis
+        val lastCatTime = lastCategoryTriggerTimes[category.id] ?: 0L
+        if (now - lastCatTime < categoryCooldown) {
+            val remainingSec = (categoryCooldown - (now - lastCatTime)) / 1000
+            Log.d(tag, "Reaction suppressed: Category cooldown for ${category.id} ($remainingSec s remaining). Reason: $reason")
+            return false
+        }
+
+        // Record cooldown timestamps immediately to eliminate concurrency races
+        lastGlobalTriggerTime = now
+        lastCategoryTriggerTimes[category.id] = now
+
+        // Dispatch playback asynchronously
+        scope.launch {
+            executeReactionInternal(category, settings)
+        }
+        return true
     }
 
     /**
@@ -294,10 +366,6 @@ class ReactionController private constructor(private val context: Context) {
     }
 
     private suspend fun executeReactionInternal(category: AudioCategory, settings: LivingSettings) {
-        val now = System.currentTimeMillis()
-        lastGlobalTriggerTime = now
-        lastCategoryTriggerTimes[category.id] = now
-
         _isReacting.value = true
 
         val playResult = audioEngine.playCategory(category)
@@ -311,12 +379,23 @@ class ReactionController private constructor(private val context: Context) {
             category = category,
             clipPath = clipPath,
             result = playResult,
-            timestamp = now
+            timestamp = System.currentTimeMillis()
         )
 
         Log.i(tag, "Reaction executed for ${category.displayName}. Result: $playResult")
         kotlinx.coroutines.delay(3500L)
         _isReacting.value = false
+    }
+
+    fun resetCooldownsForTesting() {
+        lastGlobalTriggerTime = 0L
+        lastCategoryTriggerTimes.clear()
+        lastExplicitPowerState = null
+        lastExplicitPowerTimestamp = 0L
+        lastBatteryLevel = -1
+        isBattery15Triggered = false
+        isBattery100Triggered = false
+        lateNightProcessedToday.clear()
     }
 
     companion object {

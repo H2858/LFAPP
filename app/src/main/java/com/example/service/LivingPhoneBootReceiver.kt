@@ -11,36 +11,60 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeout
 
 class LivingPhoneBootReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
         val action = intent.action ?: return
-        Log.i("LivingPhone_Boot", "System broadcast received: $action. Restoring state...")
+        Log.i("LivingPhone_Boot", "System broadcast received: $action. Restoring Living Phone state...")
 
-        val repository = PreferencesRepository(context)
+        // Always schedule next late night alarm immediately and synchronously
+        AlarmScheduler.scheduleNextLateNightAlarm(context)
+
+        // Use goAsync() to keep receiver alive during async DataStore check
+        val pendingResult = goAsync()
+
         CoroutineScope(Dispatchers.IO).launch {
-            val settings = repository.settingsFlow.first()
-            if (settings.isLivingPhoneEnabled) {
-                // Restore scheduled alarms immediately
-                AlarmScheduler.scheduleNextLateNightAlarm(context)
+            try {
+                withTimeout(8000L) {
+                    val repository = PreferencesRepository(context)
+                    val settings = repository.settingsFlow.first()
 
-                // Start ambient service if permitted by system
-                val serviceIntent = Intent(context, LivingPhoneService::class.java).apply {
-                    putExtra(LivingPhoneService.EXTRA_COMMAND, LivingPhoneService.COMMAND_START)
-                }
-                try {
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                        context.startForegroundService(serviceIntent)
+                    if (settings.isLivingPhoneEnabled) {
+                        // Confirm alarms are registered based on active user settings
+                        AlarmScheduler.scheduleNextLateNightAlarm(context)
+
+                        // Attempt foreground service start following system lifecycle rules
+                        val serviceIntent = Intent(context, LivingPhoneService::class.java).apply {
+                            putExtra(LivingPhoneService.EXTRA_COMMAND, LivingPhoneService.COMMAND_START)
+                        }
+
+                        try {
+                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                                context.startForegroundService(serviceIntent)
+                            } else {
+                                context.startService(serviceIntent)
+                            }
+                            Log.d("LivingPhone_Boot", "Ambient foreground service started successfully")
+                        } catch (e: Exception) {
+                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && e is ForegroundServiceStartNotAllowedException) {
+                                Log.w(
+                                    "LivingPhone_Boot",
+                                    "Foreground service start restricted by Android background execution policy at boot: ${e.message}. Alarms remain fully active."
+                                )
+                            } else {
+                                Log.e("LivingPhone_Boot", "Failed to start ambient service: ${e.message}")
+                            }
+                        }
                     } else {
-                        context.startService(serviceIntent)
-                    }
-                } catch (e: Exception) {
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && e is ForegroundServiceStartNotAllowedException) {
-                        Log.w("LivingPhone_Boot", "Foreground service start restricted by system at this moment: ${e.message}")
-                    } else {
-                        Log.e("LivingPhone_Boot", "Failed to start service: ${e.message}")
+                        // If living phone is paused by user, cancel any pending alarms
+                        AlarmScheduler.cancelAlarms(context)
                     }
                 }
+            } catch (e: Exception) {
+                Log.e("LivingPhone_Boot", "Error during boot receiver async execution: ${e.message}")
+            } finally {
+                pendingResult.finish()
             }
         }
     }
