@@ -27,12 +27,7 @@ android {
       keyAlias = "upload"
       keyPassword = System.getenv("KEY_PASSWORD")
     }
-    create("debugConfig") {
-      storeFile = file("${rootDir}/debug.keystore")
-      storePassword = "android"
-      keyAlias = "androiddebugkey"
-      keyPassword = "android"
-    }
+    // تم حذف debugConfig المخصص لتجنب خطأ ملف debug.keystore المفقود
   }
 
   buildTypes {
@@ -43,7 +38,7 @@ android {
       signingConfig = signingConfigs.getByName("release")
     }
     debug {
-      signingConfig = signingConfigs.getByName("debugConfig")
+      // سيعتمد وضع الـ Debug الآن على التوقيع الافتراضي تلقائياً بدون أخطاء
     }
   }
   
@@ -111,7 +106,6 @@ dependencies {
   debugImplementation(libs.androidx.compose.ui.test.manifest)
   debugImplementation(libs.androidx.compose.ui.tooling)
   
-  // استخدام KSP بشكل آمن وخفيف بدون مهام الواجهة الرسومية
   add("ksp", libs.androidx.room.compiler)
   add("ksp", libs.moshi.kotlin.codegen)
 }
