@@ -21,6 +21,13 @@ enum class ReactionFrequency(
     val globalCooldownMillis: Long,
     val categoryCooldownMillis: Long
 ) {
+    INSTANT(
+        id = "instant",
+        title = "Instant (2s)",
+        description = "Hyper responsive. 2s minimum interval.",
+        globalCooldownMillis = 2000L,
+        categoryCooldownMillis = 2000L
+    ),
     LOW(
         id = "low",
         title = "Low",
@@ -45,7 +52,7 @@ enum class ReactionFrequency(
 
     companion object {
         fun fromId(id: String): ReactionFrequency {
-            return entries.find { it.id == id } ?: NORMAL
+            return entries.find { it.id == id } ?: INSTANT
         }
     }
 }
@@ -53,7 +60,7 @@ enum class ReactionFrequency(
 data class LivingSettings(
     val isLivingPhoneEnabled: Boolean = true,
     val isVoiceEnabled: Boolean = true,
-    val frequency: ReactionFrequency = ReactionFrequency.NORMAL,
+    val frequency: ReactionFrequency = ReactionFrequency.INSTANT,
     val lastReactionTimestamp: Long = 0L,
     val lastReactionCategory: String = "",
     val lastReactionClip: String = ""
@@ -74,7 +81,7 @@ class PreferencesRepository(private val context: Context) {
     val settingsFlow: Flow<LivingSettings> = context.dataStore.data.map { prefs ->
         val enabled = prefs[Keys.LIVING_ENABLED] ?: true
         val voice = prefs[Keys.VOICE_ENABLED] ?: true
-        val freqStr = prefs[Keys.FREQUENCY] ?: ReactionFrequency.NORMAL.id
+        val freqStr = prefs[Keys.FREQUENCY] ?: ReactionFrequency.INSTANT.id
         val lastTime = prefs[Keys.LAST_REACTION_TIME] ?: 0L
         val lastCat = prefs[Keys.LAST_REACTION_CATEGORY] ?: ""
         val lastClip = prefs[Keys.LAST_REACTION_CLIP] ?: ""
