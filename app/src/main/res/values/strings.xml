@@ -1,0 +1,21 @@
+<resources>
+    <string name="app_name">Living Phone</string>
+    <string name="status_living">Living</string>
+    <string name="status_paused">Paused</string>
+    <string name="turn_on">Awaken</string>
+    <string name="turn_off">Sleep</string>
+    <string name="settings_title">Settings</string>
+    <string name="voice_reactions">Voice Reactions</string>
+    <string name="reaction_frequency">Reaction Frequency</string>
+    <string name="frequency_low">Low</string>
+    <string name="frequency_normal">Normal</string>
+    <string name="frequency_high">High</string>
+    <string name="test_audio">Audio Verification</string>
+    <string name="test_button">Test</string>
+    <string name="privacy_title">Zero Telemetry &amp; Privacy</string>
+    <string name="privacy_desc">Living Phone runs entirely on-device with zero analytics, no internet connection, and zero artificial intelligence hallucinations. It reacts to your ambient environment strictly using your own audio assets.</string>
+    <string name="notification_channel_name">Living Phone Ambient Service</string>
+    <string name="notification_channel_desc">Monitors ambient device states to trigger living reactions</string>
+    <string name="notification_service_active">Living Phone is awake</string>
+    <string name="notification_service_monitoring">Monitoring ambient state &amp; device rhythm</string>
+</resources>

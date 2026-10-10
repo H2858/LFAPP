@@ -1,0 +1,6 @@
+{
+  "name": "Living Phone",
+  "description": "An ambient living phone companion with glassmorphic aesthetics and contextual audio reactions.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
