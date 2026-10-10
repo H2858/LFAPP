@@ -15,11 +15,8 @@ import kotlinx.coroutines.withTimeout
 
 class LivingPhoneBootReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
-        val action = intent.action ?: return
+        val action = intent.action ?: "SYSTEM_BOOT_TRIGGER"
         Log.i("LivingPhone_Boot", "System broadcast received: $action. Restoring Living Phone state...")
-
-        // Always schedule next late night alarm immediately and synchronously
-        AlarmScheduler.scheduleNextLateNightAlarm(context)
 
         // Use goAsync() to keep receiver alive during async DataStore check
         val pendingResult = goAsync()
@@ -30,8 +27,9 @@ class LivingPhoneBootReceiver : BroadcastReceiver() {
                     val repository = PreferencesRepository(context)
                     val settings = repository.settingsFlow.first()
 
+                    // Check saved settings before scheduling alarms or starting service
                     if (settings.isLivingPhoneEnabled) {
-                        // Confirm alarms are registered based on active user settings
+                        Log.d("LivingPhone_Boot", "Living Phone is enabled. Scheduling late-night alarms.")
                         AlarmScheduler.scheduleNextLateNightAlarm(context)
 
                         // Attempt foreground service start following system lifecycle rules
@@ -57,14 +55,18 @@ class LivingPhoneBootReceiver : BroadcastReceiver() {
                             }
                         }
                     } else {
-                        // If living phone is paused by user, cancel any pending alarms
+                        Log.d("LivingPhone_Boot", "Living Phone is paused. Ensuring no late-night alarms are scheduled.")
                         AlarmScheduler.cancelAlarms(context)
                     }
                 }
             } catch (e: Exception) {
                 Log.e("LivingPhone_Boot", "Error during boot receiver async execution: ${e.message}")
             } finally {
-                pendingResult.finish()
+                try {
+                    pendingResult.finish()
+                } catch (e: Exception) {
+                    Log.w("LivingPhone_Boot", "Error finishing pendingResult: ${e.message}")
+                }
             }
         }
     }

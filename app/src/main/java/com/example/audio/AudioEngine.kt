@@ -10,8 +10,10 @@ import android.util.Log
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.suspendCancellableCoroutine
 import java.io.IOException
 import java.util.concurrent.ConcurrentHashMap
+import kotlin.coroutines.resume
 
 sealed interface AudioPlayResult {
     data class Success(val assetPath: String, val category: AudioCategory) : AudioPlayResult
@@ -66,7 +68,7 @@ class AudioEngine(private val context: Context) {
     }
 
     /**
-     * Plays a clip from the specified category.
+     * Plays a clip from the specified category synchronously/fire-and-forget.
      * Selects randomly among available files, avoiding immediate repetition when possible.
      */
     fun playCategory(category: AudioCategory): AudioPlayResult {
@@ -76,7 +78,6 @@ class AudioEngine(private val context: Context) {
             return AudioPlayResult.MissingFiles(category, category.fullAssetPaths)
         }
 
-        // Avoid immediate repetition if more than 1 clip is available
         val lastPlayed = lastPlayedMap[category.id]
         val candidatePool = if (availableClips.size > 1 && lastPlayed != null) {
             availableClips.filter { it != lastPlayed }.ifEmpty { availableClips }
@@ -91,12 +92,37 @@ class AudioEngine(private val context: Context) {
     }
 
     /**
+     * Suspending playback method that safely awaits asynchronous prepareAsync() and playback completion
+     * or preparation/playback failure. Ideal for background/alarm executions where wake locks must be held.
+     */
+    suspend fun playCategorySuspending(category: AudioCategory): AudioPlayResult {
+        val availableClips = AudioCatalog.getAvailableClips(context, category)
+        if (availableClips.isEmpty()) {
+            Log.d(tag, "No voice clips found for category: ${category.displayName} (${category.folderPath})")
+            return AudioPlayResult.MissingFiles(category, category.fullAssetPaths)
+        }
+
+        val lastPlayed = lastPlayedMap[category.id]
+        val candidatePool = if (availableClips.size > 1 && lastPlayed != null) {
+            availableClips.filter { it != lastPlayed }.ifEmpty { availableClips }
+        } else {
+            availableClips
+        }
+
+        val selectedPath = candidatePool.random()
+        lastPlayedMap[category.id] = selectedPath
+
+        return playAssetFileSuspending(selectedPath, category)
+    }
+
+    /**
      * Plays a specific asset file with audio focus and single-playback concurrency.
      * Safely closes AssetFileDescriptor immediately after setting data source.
      */
     fun playAssetFile(assetPath: String, category: AudioCategory): AudioPlayResult {
         synchronized(playerLock) {
-            if (isBusyPlayingOrPreparing || mediaPlayer?.isPlaying == true) {
+            val isCurrentlyPlaying = try { mediaPlayer?.isPlaying == true } catch (_: Exception) { false }
+            if (isBusyPlayingOrPreparing || isCurrentlyPlaying) {
                 Log.d(tag, "Playback busy, another clip is currently active: ${_currentPlayingClip.value}")
                 return AudioPlayResult.Busy(_currentPlayingClip.value ?: "unknown")
             }
@@ -130,6 +156,10 @@ class AudioEngine(private val context: Context) {
 
                 player.setOnPreparedListener { mp ->
                     synchronized(playerLock) {
+                        if (mediaPlayer !== mp) {
+                            try { mp.release() } catch (_: Exception) {}
+                            return@synchronized
+                        }
                         try {
                             mp.start()
                             _isPlaying.value = true
@@ -165,6 +195,97 @@ class AudioEngine(private val context: Context) {
         }
     }
 
+    /**
+     * Suspending version of playAssetFile that safely bridges prepareAsync(), onCompletion,
+     * and onError listeners to a coroutine continuation.
+     */
+    suspend fun playAssetFileSuspending(assetPath: String, category: AudioCategory): AudioPlayResult =
+        suspendCancellableCoroutine { continuation ->
+            val hasResumed = java.util.concurrent.atomic.AtomicBoolean(false)
+
+            fun safeResume(result: AudioPlayResult) {
+                if (hasResumed.compareAndSet(false, true)) {
+                    if (continuation.isActive) {
+                        continuation.resume(result)
+                    }
+                }
+            }
+
+            synchronized(playerLock) {
+                val isCurrentlyPlaying = try { mediaPlayer?.isPlaying == true } catch (_: Exception) { false }
+                if (isBusyPlayingOrPreparing || isCurrentlyPlaying) {
+                    Log.d(tag, "Playback busy, another clip is currently active: ${_currentPlayingClip.value}")
+                    safeResume(AudioPlayResult.Busy(_currentPlayingClip.value ?: "unknown"))
+                    return@suspendCancellableCoroutine
+                }
+
+                val focusGranted = requestAudioFocus()
+                if (!focusGranted) {
+                    Log.w(tag, "Audio focus request rejected by system")
+                    safeResume(AudioPlayResult.Error("Audio focus rejected by system"))
+                    return@suspendCancellableCoroutine
+                }
+
+                isBusyPlayingOrPreparing = true
+                _currentPlayingClip.value = assetPath
+
+                try {
+                    releasePlayerInternal()
+
+                    val player = MediaPlayer()
+                    player.setAudioAttributes(
+                        AudioAttributes.Builder()
+                            .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                            .setUsage(AudioAttributes.USAGE_ASSISTANCE_SONIFICATION)
+                            .build()
+                    )
+
+                    context.assets.openFd(assetPath).use { afd ->
+                        player.setDataSource(afd.fileDescriptor, afd.startOffset, afd.length)
+                    }
+
+                    player.setOnPreparedListener { mp ->
+                        synchronized(playerLock) {
+                            if (mediaPlayer !== mp) {
+                                try { mp.release() } catch (_: Exception) {}
+                                return@synchronized
+                            }
+                            try {
+                                mp.start()
+                                _isPlaying.value = true
+                            } catch (e: Exception) {
+                                Log.e(tag, "Error starting MediaPlayer on prepare: ${e.message}")
+                                stopPlayback()
+                                safeResume(AudioPlayResult.Error("Failed starting MediaPlayer: ${e.message}"))
+                            }
+                        }
+                    }
+
+                    player.setOnCompletionListener {
+                        stopPlayback()
+                        safeResume(AudioPlayResult.Success(assetPath, category))
+                    }
+
+                    player.setOnErrorListener { _, what, extra ->
+                        Log.e(tag, "MediaPlayer error during async prepare or playback: what=$what, extra=$extra for $assetPath")
+                        stopPlayback()
+                        safeResume(AudioPlayResult.Error("MediaPlayer error: what=$what, extra=$extra"))
+                        true
+                    }
+
+                    mediaPlayer = player
+                    player.prepareAsync()
+                } catch (e: Exception) {
+                    cleanupFailedAttempt()
+                    safeResume(AudioPlayResult.Error("Playback initialization failed: ${e.message}"))
+                }
+            }
+
+            continuation.invokeOnCancellation {
+                stopPlayback()
+            }
+        }
+
     private fun cleanupFailedAttempt() {
         releasePlayerInternal()
         abandonAudioFocus()
@@ -187,18 +308,32 @@ class AudioEngine(private val context: Context) {
     }
 
     private fun releasePlayerInternal() {
+        val player = mediaPlayer ?: return
+        mediaPlayer = null
         try {
-            mediaPlayer?.let {
-                if (it.isPlaying) {
-                    it.stop()
+            // Null listeners first so no asynchronous callbacks fire during teardown
+            try {
+                player.setOnPreparedListener(null)
+                player.setOnCompletionListener(null)
+                player.setOnErrorListener(null)
+            } catch (_: Exception) {}
+
+            try {
+                val isPlaying = try { player.isPlaying } catch (_: Exception) { false }
+                if (isPlaying) {
+                    player.stop()
                 }
-                it.reset()
-                it.release()
-            }
+            } catch (_: Exception) {}
+
+            try {
+                player.reset()
+            } catch (_: Exception) {}
+
+            try {
+                player.release()
+            } catch (_: Exception) {}
         } catch (e: Exception) {
             Log.w(tag, "Error releasing MediaPlayer: ${e.message}")
-        } finally {
-            mediaPlayer = null
         }
     }
 

@@ -274,10 +274,14 @@ class ReactionController private constructor(private val context: Context) {
         }
 
         lateNightProcessedToday[memoryKey] = true
-        preferencesRepository.recordLateNightHourTriggered(targetHour, todayStr)
+        try {
+            preferencesRepository.recordLateNightHourTriggered(targetHour, todayStr)
+        } catch (e: Exception) {
+            Log.w(tag, "Failed to record late night hour in preferences: ${e.message}")
+        }
 
-        executeReactionInternal(targetCategory, settings)
-        return true
+        val playResult = executeReactionInternal(targetCategory, settings)
+        return playResult is AudioPlayResult.Success
     }
 
     /**
@@ -365,26 +369,42 @@ class ReactionController private constructor(private val context: Context) {
         }
     }
 
-    private suspend fun executeReactionInternal(category: AudioCategory, settings: LivingSettings) {
+    private suspend fun executeReactionInternal(category: AudioCategory, settings: LivingSettings): AudioPlayResult {
         _isReacting.value = true
+        return try {
+            val playResult = audioEngine.playCategorySuspending(category)
+            val clipPath = if (playResult is AudioPlayResult.Success) playResult.assetPath else null
 
-        val playResult = audioEngine.playCategory(category)
-        val clipPath = if (playResult is AudioPlayResult.Success) playResult.assetPath else null
+            if (clipPath != null) {
+                try {
+                    preferencesRepository.recordReaction(category.id, clipPath)
+                } catch (e: Exception) {
+                    Log.w(tag, "Failed to record reaction: ${e.message}")
+                }
+            }
 
-        if (clipPath != null) {
-            preferencesRepository.recordReaction(category.id, clipPath)
+            _latestReaction.value = ReactionFeedback(
+                category = category,
+                clipPath = clipPath,
+                result = playResult,
+                timestamp = System.currentTimeMillis()
+            )
+
+            Log.i(tag, "Reaction executed for ${category.displayName}. Result: $playResult")
+            playResult
+        } catch (e: Exception) {
+            Log.e(tag, "Error during executeReactionInternal for ${category.displayName}: ${e.message}", e)
+            val errorResult = AudioPlayResult.Error("Reaction failed: ${e.message}")
+            _latestReaction.value = ReactionFeedback(
+                category = category,
+                clipPath = null,
+                result = errorResult,
+                timestamp = System.currentTimeMillis()
+            )
+            errorResult
+        } finally {
+            _isReacting.value = false
         }
-
-        _latestReaction.value = ReactionFeedback(
-            category = category,
-            clipPath = clipPath,
-            result = playResult,
-            timestamp = System.currentTimeMillis()
-        )
-
-        Log.i(tag, "Reaction executed for ${category.displayName}. Result: $playResult")
-        kotlinx.coroutines.delay(3500L)
-        _isReacting.value = false
     }
 
     fun resetCooldownsForTesting() {

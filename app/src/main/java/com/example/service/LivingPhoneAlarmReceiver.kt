@@ -68,7 +68,9 @@ class LivingPhoneAlarmReceiver : BroadcastReceiver() {
                         wakeLock.release()
                     } catch (_: Exception) {}
                 }
-                pendingResult.finish()
+                try {
+                    pendingResult.finish()
+                } catch (_: Exception) {}
             }
         }
     }

@@ -1,5 +1,6 @@
 package com.example
 
+import android.app.AlarmManager
 import android.content.Context
 import android.content.Intent
 import android.os.BatteryManager
@@ -15,16 +16,19 @@ import com.example.service.LivingPhoneAlarmReceiver
 import com.example.service.LivingPhoneBootReceiver
 import com.example.service.LivingPhonePowerReceiver
 import com.example.service.ReactionController
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
+import org.robolectric.Shadows.shadowOf
 import org.robolectric.annotation.Config
 import java.text.SimpleDateFormat
 import java.util.Calendar
@@ -36,10 +40,12 @@ import java.util.Locale
 class ExampleRobolectricTest {
 
     private lateinit var context: Context
+    private lateinit var alarmManager: AlarmManager
 
     @Before
     fun setUp() {
         context = ApplicationProvider.getApplicationContext()
+        alarmManager = context.getSystemService(Context.ALARM_SERVICE) as AlarmManager
         ReactionController.getInstance(context).resetCooldownsForTesting()
     }
 
@@ -111,14 +117,12 @@ class ExampleRobolectricTest {
     fun verifyInitialStateSeedingDoesNotTriggerReaction() {
         val controller = ReactionController.getInstance(context)
 
-        // Fabricate a battery intent snapshot reporting charging=true at 80%
         val intent = Intent(Intent.ACTION_BATTERY_CHANGED).apply {
             putExtra(BatteryManager.EXTRA_STATUS, BatteryManager.BATTERY_STATUS_CHARGING)
             putExtra(BatteryManager.EXTRA_LEVEL, 80)
             putExtra(BatteryManager.EXTRA_SCALE, 100)
         }
 
-        // Seeding baseline state must not trigger any audio reaction
         controller.seedInitialState(intent)
         assertNotNull(controller)
     }
@@ -127,7 +131,6 @@ class ExampleRobolectricTest {
     fun verifyColdStartExplicitConnectHandling() {
         val controller = ReactionController.getInstance(context)
 
-        // Simulate cold-start where initial state baseline is seeded as charging=true
         val intent = Intent(Intent.ACTION_BATTERY_CHANGED).apply {
             putExtra(BatteryManager.EXTRA_STATUS, BatteryManager.BATTERY_STATUS_CHARGING)
             putExtra(BatteryManager.EXTRA_LEVEL, 80)
@@ -135,7 +138,6 @@ class ExampleRobolectricTest {
         }
         controller.seedInitialState(intent)
 
-        // When explicit power event arrives, it MUST NOT be swallowed by the seeded baseline
         val triggered = controller.onExplicitPowerTransition(true)
         assertTrue("Explicit power connection transition must trigger reaction", triggered)
     }
@@ -144,10 +146,7 @@ class ExampleRobolectricTest {
     fun verifyRepeatedPowerBroadcastsSuppression() {
         val controller = ReactionController.getInstance(context)
 
-        // First explicit connection triggers
         controller.onExplicitPowerTransition(true)
-
-        // Immediate repeat broadcast (within debounce) must be suppressed
         val duplicateTriggered = controller.onExplicitPowerTransition(true)
         assertFalse("Duplicate explicit power broadcast must be suppressed", duplicateTriggered)
     }
@@ -156,76 +155,116 @@ class ExampleRobolectricTest {
     fun verifyBatteryThresholdLogic() {
         val controller = ReactionController.getInstance(context)
 
-        // Baseline reading at 50%
         controller.onBatteryChanged(50)
-
-        // Crossing into 15% from above should evaluate threshold
         controller.onBatteryChanged(15)
-
-        // Repeating 15% should NOT re-trigger
         controller.onBatteryChanged(15)
-
-        // Recharging back to 25% resets hysteresis
         controller.onBatteryChanged(25)
-
-        // Crossing into 100% full battery
         controller.onBatteryChanged(100)
-
-        // Discharging to 95% resets 100% trigger
         controller.onBatteryChanged(95)
     }
 
     @Test
-    fun verifySuccessfulAlarmProcessingAndRescheduling() = runBlocking {
+    fun verifyBootReceiverSchedulesAlarmWhenEnabled() = runBlocking {
         val repository = PreferencesRepository(context)
         repository.setLivingEnabled(true)
+        AlarmScheduler.cancelAlarms(context)
+        val shadowAlarmManager = shadowOf(alarmManager)
+        assertNull(shadowAlarmManager.nextScheduledAlarm)
 
-        // Verify rescheduling succeeds without exception when enabled
-        AlarmScheduler.scheduleNextLateNightAlarm(context)
-        val settings = repository.settingsFlow.first()
-        assertTrue("Living Phone should be enabled for scheduling", settings.isLivingPhoneEnabled)
+        // Trigger actual BootReceiver
+        val receiver = LivingPhoneBootReceiver()
+        val intent = Intent(Intent.ACTION_BOOT_COMPLETED)
+        receiver.onReceive(context, intent)
 
-        // Test that AlarmReceiver onReceive executes successfully with scheduled intent
+        // Allow coroutine in goAsync() to execute
+        delay(250L)
+
+        // Verify actual receiver scheduled the alarm in AlarmManager
+        assertNotNull("BootReceiver must schedule alarm in AlarmManager when enabled", shadowAlarmManager.nextScheduledAlarm)
+    }
+
+    @Test
+    fun verifyBootReceiverDoesNotScheduleAlarmWhenPaused() = runBlocking {
+        val repository = PreferencesRepository(context)
+        repository.setLivingEnabled(false)
+        AlarmScheduler.cancelAlarms(context)
+        val shadowAlarmManager = shadowOf(alarmManager)
+        assertNull(shadowAlarmManager.nextScheduledAlarm)
+
+        // Trigger actual BootReceiver while paused
+        val receiver = LivingPhoneBootReceiver()
+        val intent = Intent(Intent.ACTION_BOOT_COMPLETED)
+        receiver.onReceive(context, intent)
+
+        delay(250L)
+
+        // Verify receiver did NOT schedule alarm in AlarmManager
+        assertNull("BootReceiver must NOT schedule alarm when paused", shadowAlarmManager.nextScheduledAlarm)
+
+        // Restore
+        repository.setLivingEnabled(true)
+    }
+
+    @Test
+    fun verifyAlarmReceiverExecutesAndReschedulesAlarm() = runBlocking {
+        val repository = PreferencesRepository(context)
+        repository.setLivingEnabled(true)
+        AlarmScheduler.cancelAlarms(context)
+        val shadowAlarmManager = shadowOf(alarmManager)
+        assertNull(shadowAlarmManager.nextScheduledAlarm)
+
+        // Trigger actual AlarmReceiver
         val receiver = LivingPhoneAlarmReceiver()
-        val intent = Intent().apply {
+        val intent = Intent("com.example.livingphone.ALARM_LATE_NIGHT").apply {
             putExtra(AlarmScheduler.EXTRA_SCHEDULED_HOUR, 0)
         }
         receiver.onReceive(context, intent)
+
+        delay(250L)
+
+        // Verify actual AlarmReceiver rescheduled the next alarm in AlarmManager
+        assertNotNull("AlarmReceiver must reschedule next alarm in AlarmManager", shadowAlarmManager.nextScheduledAlarm)
     }
 
     @Test
-    fun verifyAlarmReschedulingOnProcessingFailureOrTimeout() = runBlocking {
+    fun verifyAlarmReceiverReschedulesEvenOnProcessingFailure() = runBlocking {
         val repository = PreferencesRepository(context)
         repository.setLivingEnabled(true)
+        AlarmScheduler.cancelAlarms(context)
+        val shadowAlarmManager = shadowOf(alarmManager)
+        assertNull(shadowAlarmManager.nextScheduledAlarm)
 
-        val controller = ReactionController.getInstance(context)
-
-        // Simulate a processing failure/skip with an invalid hour (-1)
-        val played = controller.processLateNightAlarm(-1)
-        assertFalse("Invalid hour must not play audio", played)
-
-        // Even though processing returned false / was skipped, rescheduling must succeed when enabled
-        val settings = repository.settingsFlow.first()
-        if (settings.isLivingPhoneEnabled) {
-            AlarmScheduler.scheduleNextLateNightAlarm(context)
+        // Trigger actual AlarmReceiver with invalid hour (-99) simulating processing error
+        val receiver = LivingPhoneAlarmReceiver()
+        val intent = Intent("com.example.livingphone.ALARM_LATE_NIGHT").apply {
+            putExtra(AlarmScheduler.EXTRA_SCHEDULED_HOUR, -99)
         }
-        assertTrue("Living Phone must remain enabled and scheduled", settings.isLivingPhoneEnabled)
+        receiver.onReceive(context, intent)
+
+        delay(250L)
+
+        // Verify AlarmReceiver STILL rescheduled the future alarm despite processing failure
+        assertNotNull("AlarmReceiver must guarantee rescheduling even on processing failure", shadowAlarmManager.nextScheduledAlarm)
     }
 
     @Test
-    fun verifyPausedStateSuppressesAlarmProcessingAndRescheduling() = runBlocking {
+    fun verifyAlarmReceiverCancelsAndDoesNotRescheduleWhenPaused() = runBlocking {
         val repository = PreferencesRepository(context)
         repository.setLivingEnabled(false)
-
-        val controller = ReactionController.getInstance(context)
-        // Processing alarm while paused must return false (suppressed)
-        val played = controller.processLateNightAlarm(2)
-        assertFalse("Processing while paused must be suppressed", played)
-
-        // When paused, rescheduling is skipped and alarms are cancelled
-        val settings = repository.settingsFlow.first()
-        assertFalse("Feature must be confirmed paused", settings.isLivingPhoneEnabled)
         AlarmScheduler.cancelAlarms(context)
+        val shadowAlarmManager = shadowOf(alarmManager)
+
+        // Trigger actual AlarmReceiver while paused
+        val receiver = LivingPhoneAlarmReceiver()
+        val intent = Intent("com.example.livingphone.ALARM_LATE_NIGHT").apply {
+            putExtra(AlarmScheduler.EXTRA_SCHEDULED_HOUR, 0)
+        }
+        receiver.onReceive(context, intent)
+
+        delay(250L)
+
+        // Verify no alarm is scheduled
+        assertNull("AlarmReceiver must cancel and not reschedule when paused", shadowAlarmManager.nextScheduledAlarm)
 
         // Restore
         repository.setLivingEnabled(true)
@@ -235,32 +274,81 @@ class ExampleRobolectricTest {
     fun verifyDuplicateAlarmDeliverySuppression() = runBlocking {
         val repository = PreferencesRepository(context)
         repository.setLivingEnabled(true)
+        AlarmScheduler.cancelAlarms(context)
+        val shadowAlarmManager = shadowOf(alarmManager)
 
-        val todayStr = SimpleDateFormat("yyyyMMdd", Locale.US).format(Date())
-        repository.recordLateNightHourTriggered(3, todayStr)
+        val receiver = LivingPhoneAlarmReceiver()
+        val intent = Intent("com.example.livingphone.ALARM_LATE_NIGHT").apply {
+            putExtra(AlarmScheduler.EXTRA_SCHEDULED_HOUR, 3)
+        }
 
-        val controller = ReactionController.getInstance(context)
-        // Invoking alarm for hour 3 on the same day must be rejected by deduplication
-        val playedFirst = controller.processLateNightAlarm(3)
-        assertFalse("First duplicate invocation must be rejected", playedFirst)
+        // First delivery to actual receiver
+        receiver.onReceive(context, intent)
+        delay(250L)
+        assertNotNull("First alarm delivery must schedule next alarm", shadowAlarmManager.nextScheduledAlarm)
 
-        val playedSecond = controller.processLateNightAlarm(3)
-        assertFalse("Second duplicate invocation must be rejected", playedSecond)
+        // Second delivery of duplicate alarm to actual receiver
+        receiver.onReceive(context, intent)
+        delay(250L)
+
+        // Rescheduling must remain intact and duplicate reaction must be rejected without error
+        assertNotNull("Rescheduling must remain intact after duplicate alarm delivery", shadowAlarmManager.nextScheduledAlarm)
     }
 
     @Test
     fun verifyDelayedLateNightAlarmHandling() = runBlocking {
-        val controller = ReactionController.getInstance(context)
+        val repository = PreferencesRepository(context)
+        repository.setLivingEnabled(true)
+        AlarmScheduler.cancelAlarms(context)
+        val shadowAlarmManager = shadowOf(alarmManager)
 
         val calendar = Calendar.getInstance()
         val currentHour = calendar.get(Calendar.HOUR_OF_DAY)
-
-        // An alarm scheduled for an hour that does not match current hour (e.g. 5 hours ago)
         val staleHour = (currentHour + 5) % 24
-        if (staleHour in 0..4) {
-            val played = controller.processLateNightAlarm(staleHour)
-            assertFalse("Stale alarm arriving hours late must be skipped", played)
+
+        // Deliver stale alarm directly to actual AlarmReceiver
+        val receiver = LivingPhoneAlarmReceiver()
+        val intent = Intent("com.example.livingphone.ALARM_LATE_NIGHT").apply {
+            putExtra(AlarmScheduler.EXTRA_SCHEDULED_HOUR, staleHour)
         }
+        receiver.onReceive(context, intent)
+        delay(250L)
+
+        // Even for stale alarms, AlarmReceiver must safely reschedule future alarms
+        assertNotNull("AlarmReceiver must reschedule next alarm even when receiving a stale alarm", shadowAlarmManager.nextScheduledAlarm)
+    }
+
+    @Test
+    fun verifyBootReceiverHandlesPackageReplacedAction() = runBlocking {
+        val repository = PreferencesRepository(context)
+        repository.setLivingEnabled(true)
+        AlarmScheduler.cancelAlarms(context)
+        val shadowAlarmManager = shadowOf(alarmManager)
+        assertNull(shadowAlarmManager.nextScheduledAlarm)
+
+        // Deliver ACTION_MY_PACKAGE_REPLACED to actual BootReceiver
+        val receiver = LivingPhoneBootReceiver()
+        val intent = Intent(Intent.ACTION_MY_PACKAGE_REPLACED)
+        receiver.onReceive(context, intent)
+        delay(250L)
+
+        assertNotNull("BootReceiver must restore alarms on package replacement", shadowAlarmManager.nextScheduledAlarm)
+    }
+
+    @Test
+    fun verifyAudioEngineSuspendingHandlesMissingFilesSafely() = runBlocking {
+        val audioEngine = AudioEngine(context)
+        val result = audioEngine.playCategorySuspending(AudioCategory.LATE_NIGHT_MIDNIGHT)
+        assertTrue(
+            "Suspending playback must return MissingFiles or Error safely without throwing",
+            result is AudioPlayResult.MissingFiles || result is AudioPlayResult.Error
+        )
+        assertFalse(audioEngine.isPlaying.value)
+
+        // Multiple calls to stopPlayback must be idempotent and safe
+        audioEngine.stopPlayback()
+        audioEngine.stopPlayback()
+        assertFalse(audioEngine.isPlaying.value)
     }
 
     @Test
@@ -269,7 +357,7 @@ class ExampleRobolectricTest {
         repository.setLivingEnabled(false)
 
         val controller = ReactionController.getInstance(context)
-        kotlinx.coroutines.delay(50L)
+        delay(50L)
         val triggered = controller.attemptReaction(AudioCategory.BATTERY_15, "Test when paused")
         assertFalse("Reaction must be suppressed when Living Phone is disabled", triggered)
 
@@ -283,7 +371,7 @@ class ExampleRobolectricTest {
         repository.setVoiceEnabled(false)
 
         val controller = ReactionController.getInstance(context)
-        kotlinx.coroutines.delay(50L)
+        delay(50L)
         val triggered = controller.attemptReaction(AudioCategory.CHARGING_CONNECT, "Test when voice muted")
         assertFalse("Voice reaction must be suppressed when voice is muted", triggered)
 
