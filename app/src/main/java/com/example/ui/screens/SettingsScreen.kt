@@ -258,6 +258,7 @@ fun SettingsScreen(
                                         Spacer(modifier = Modifier.height(4.dp))
                                         Text(
                                             text = when (freq) {
+                                                ReactionFrequency.INSTANT -> "2 sec"
                                                 ReactionFrequency.LOW -> "10 min"
                                                 ReactionFrequency.NORMAL -> "3 min"
                                                 ReactionFrequency.HIGH -> "45 sec"
