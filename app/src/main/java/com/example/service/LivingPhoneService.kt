@@ -38,16 +38,13 @@ class LivingPhoneService : Service(), SensorEventListener {
     private var accelerometer: Sensor? = null
     private var isSensorsRegistered = false
 
-    // Ambient light debounce state
     private var darkCandidateTimestamp = 0L
     private var wasConfirmedDark = false
     private var darkConfirmedTimestamp = 0L
 
-    // Accelerometer motion state
     private var lastMotionEvaluationTime = 0L
     private var motionActivityCounter = 0
 
-    // Dynamic battery and system event receiver
     private val systemReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
             when (intent.action) {
@@ -63,6 +60,14 @@ class LivingPhoneService : Service(), SensorEventListener {
                     val isCharging = status == BatteryManager.BATTERY_STATUS_CHARGING ||
                             status == BatteryManager.BATTERY_STATUS_FULL
                     controller.onChargingChanged(isCharging)
+                }
+                Intent.ACTION_POWER_CONNECTED -> {
+                    Log.i(tag, "Power connected broadcast caught in service")
+                    controller.onExplicitPowerTransition(true)
+                }
+                Intent.ACTION_POWER_DISCONNECTED -> {
+                    Log.i(tag, "Power disconnected broadcast caught in service")
+                    controller.onExplicitPowerTransition(false)
                 }
                 Intent.ACTION_USER_PRESENT -> {
                     Log.d(tag, "Device unlocked by user: triggering usage reaction check")
@@ -125,21 +130,19 @@ class LivingPhoneService : Service(), SensorEventListener {
             startForeground(NOTIFICATION_ID, notification)
         }
 
-        // Register dynamic battery updates and user present / unlock broadcast
         val filter = IntentFilter().apply {
             addAction(Intent.ACTION_BATTERY_CHANGED)
+            addAction(Intent.ACTION_POWER_CONNECTED)
+            addAction(Intent.ACTION_POWER_DISCONNECTED)
             addAction(Intent.ACTION_USER_PRESENT)
         }
         registerReceiver(systemReceiver, filter)
 
-        // Initialize hardware sensors with battery-friendly sampling rates
         sensorManager = getSystemService(Context.SENSOR_SERVICE) as? SensorManager
         lightSensor = sensorManager?.getDefaultSensor(Sensor.TYPE_LIGHT)
         accelerometer = sensorManager?.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
-
         registerSensors()
 
-        // Schedule late night alarm checks
         AlarmScheduler.scheduleNextLateNightAlarm(this)
     }
 
@@ -179,14 +182,12 @@ class LivingPhoneService : Service(), SensorEventListener {
         try {
             unregisterReceiver(systemReceiver)
         } catch (_: Exception) {}
-
         unregisterSensors()
         serviceScope.cancel()
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
 
-    // SensorEventListener
     override fun onSensorChanged(event: SensorEvent) {
         val now = System.currentTimeMillis()
 
@@ -195,23 +196,19 @@ class LivingPhoneService : Service(), SensorEventListener {
                 val lux = event.values[0]
 
                 if (lux < 2.5f) {
-                    // Sensor reads dark. Check if sustained to avoid transient shadow false positives
                     if (!wasConfirmedDark) {
                         if (darkCandidateTimestamp == 0L) {
                             darkCandidateTimestamp = now
                         } else if (now - darkCandidateTimestamp >= 2500L) {
-                            // Remained dark for >= 2.5 seconds: confirm pocket dark
                             wasConfirmedDark = true
                             darkConfirmedTimestamp = now
                             controller.attemptReaction(AudioCategory.POCKET_DARK, "Sustained Darkness / Pocket")
                         }
                     }
                 } else {
-                    // Sensor reads light (>= 2.5f)
                     darkCandidateTimestamp = 0L
 
                     if (lux > 35.0f && wasConfirmedDark) {
-                        // Exited sustained darkness into bright light
                         if (now - darkConfirmedTimestamp >= 3000L) {
                             wasConfirmedDark = false
                             controller.attemptReaction(AudioCategory.POCKET_LIGHT, "Exited Pocket to Light")
@@ -221,26 +218,21 @@ class LivingPhoneService : Service(), SensorEventListener {
                     }
                 }
             }
-
             Sensor.TYPE_ACCELEROMETER -> {
                 val x = event.values[0]
                 val y = event.values[1]
                 val z = event.values[2]
                 val gForce = sqrt((x * x + y * y + z * z).toDouble()).toFloat() / SensorManager.GRAVITY_EARTH
 
-                // Detect motion deviation from 1G gravity
                 if (gForce > 1.35f || gForce < 0.65f) {
                     motionActivityCounter++
                 }
 
-                // Periodic evaluation every 15 seconds
                 if (now - lastMotionEvaluationTime > 15_000L) {
                     lastMotionEvaluationTime = now
                     if (motionActivityCounter > 16) {
-                        // High sustained movement -> Exercise
                         controller.attemptReaction(AudioCategory.EXERCISE, "Sustained Physical Movement")
                     } else if (motionActivityCounter > 3) {
-                        // Modest movement -> Motion
                         controller.attemptReaction(AudioCategory.MOTION, "Device Motion")
                     }
                     motionActivityCounter = 0
