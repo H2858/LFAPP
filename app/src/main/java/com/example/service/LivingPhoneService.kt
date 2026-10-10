@@ -42,8 +42,7 @@ class LivingPhoneService : Service(), SensorEventListener {
     private var wasConfirmedDark = false
     private var darkConfirmedTimestamp = 0L
 
-    private var lastMotionEvaluationTime = 0L
-    private var motionActivityCounter = 0
+    private var lastShakeTime = 0L
 
     private val systemReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
@@ -152,7 +151,7 @@ class LivingPhoneService : Service(), SensorEventListener {
             sensorManager?.registerListener(this, it, SensorManager.SENSOR_DELAY_NORMAL)
         }
         accelerometer?.let {
-            sensorManager?.registerListener(this, it, SensorManager.SENSOR_DELAY_NORMAL)
+            sensorManager?.registerListener(this, it, SensorManager.SENSOR_DELAY_UI)
         }
         isSensorsRegistered = true
     }
@@ -199,7 +198,7 @@ class LivingPhoneService : Service(), SensorEventListener {
                     if (!wasConfirmedDark) {
                         if (darkCandidateTimestamp == 0L) {
                             darkCandidateTimestamp = now
-                        } else if (now - darkCandidateTimestamp >= 2500L) {
+                        } else if (now - darkCandidateTimestamp >= 2000L) {
                             wasConfirmedDark = true
                             darkConfirmedTimestamp = now
                             controller.attemptReaction(AudioCategory.POCKET_DARK, "Sustained Darkness / Pocket")
@@ -208,8 +207,8 @@ class LivingPhoneService : Service(), SensorEventListener {
                 } else {
                     darkCandidateTimestamp = 0L
 
-                    if (lux > 35.0f && wasConfirmedDark) {
-                        if (now - darkConfirmedTimestamp >= 3000L) {
+                    if (lux > 30.0f && wasConfirmedDark) {
+                        if (now - darkConfirmedTimestamp >= 1500L) {
                             wasConfirmedDark = false
                             controller.attemptReaction(AudioCategory.POCKET_LIGHT, "Exited Pocket to Light")
                         } else {
@@ -224,18 +223,13 @@ class LivingPhoneService : Service(), SensorEventListener {
                 val z = event.values[2]
                 val gForce = sqrt((x * x + y * y + z * z).toDouble()).toFloat() / SensorManager.GRAVITY_EARTH
 
-                if (gForce > 1.35f || gForce < 0.65f) {
-                    motionActivityCounter++
-                }
-
-                if (now - lastMotionEvaluationTime > 15_000L) {
-                    lastMotionEvaluationTime = now
-                    if (motionActivityCounter > 16) {
-                        controller.attemptReaction(AudioCategory.EXERCISE, "Sustained Physical Movement")
-                    } else if (motionActivityCounter > 3) {
-                        controller.attemptReaction(AudioCategory.MOTION, "Device Motion")
+                // Detect deliberate shake (Device Motion) instantly
+                if (gForce > 2.2f) {
+                    if (now - lastShakeTime > 3000L) {
+                        lastShakeTime = now
+                        Log.i(tag, "Device shake detected (gForce=$gForce)")
+                        controller.attemptReaction(AudioCategory.MOTION, "Device Shake / Motion")
                     }
-                    motionActivityCounter = 0
                 }
             }
         }
