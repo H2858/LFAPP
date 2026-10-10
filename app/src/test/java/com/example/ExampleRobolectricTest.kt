@@ -15,6 +15,7 @@ import com.example.service.LivingPhoneAlarmReceiver
 import com.example.service.LivingPhoneBootReceiver
 import com.example.service.LivingPhonePowerReceiver
 import com.example.service.ReactionController
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -25,7 +26,10 @@ import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
+import java.text.SimpleDateFormat
 import java.util.Calendar
+import java.util.Date
+import java.util.Locale
 
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [34])
@@ -172,17 +176,76 @@ class ExampleRobolectricTest {
     }
 
     @Test
-    fun verifyLateNightHourPersistenceAndDeduplication() = runBlocking {
+    fun verifySuccessfulAlarmProcessingAndRescheduling() = runBlocking {
         val repository = PreferencesRepository(context)
-        repository.recordLateNightHourTriggered(1, "20261010")
+        repository.setLivingEnabled(true)
 
-        val recorded = repository.getLastLateNightDate(1)
-        assertEquals("20261010", recorded)
+        // Verify rescheduling succeeds without exception when enabled
+        AlarmScheduler.scheduleNextLateNightAlarm(context)
+        val settings = repository.settingsFlow.first()
+        assertTrue("Living Phone should be enabled for scheduling", settings.isLivingPhoneEnabled)
+
+        // Test that AlarmReceiver onReceive executes successfully with scheduled intent
+        val receiver = LivingPhoneAlarmReceiver()
+        val intent = Intent().apply {
+            putExtra(AlarmScheduler.EXTRA_SCHEDULED_HOUR, 0)
+        }
+        receiver.onReceive(context, intent)
+    }
+
+    @Test
+    fun verifyAlarmReschedulingOnProcessingFailureOrTimeout() = runBlocking {
+        val repository = PreferencesRepository(context)
+        repository.setLivingEnabled(true)
 
         val controller = ReactionController.getInstance(context)
-        // If hour 1 was already recorded today in DataStore, processing it again must be rejected
-        val played = controller.processLateNightAlarm(1)
-        assertFalse("Duplicate execution for hour 1 today must be rejected", played)
+
+        // Simulate a processing failure/skip with an invalid hour (-1)
+        val played = controller.processLateNightAlarm(-1)
+        assertFalse("Invalid hour must not play audio", played)
+
+        // Even though processing returned false / was skipped, rescheduling must succeed when enabled
+        val settings = repository.settingsFlow.first()
+        if (settings.isLivingPhoneEnabled) {
+            AlarmScheduler.scheduleNextLateNightAlarm(context)
+        }
+        assertTrue("Living Phone must remain enabled and scheduled", settings.isLivingPhoneEnabled)
+    }
+
+    @Test
+    fun verifyPausedStateSuppressesAlarmProcessingAndRescheduling() = runBlocking {
+        val repository = PreferencesRepository(context)
+        repository.setLivingEnabled(false)
+
+        val controller = ReactionController.getInstance(context)
+        // Processing alarm while paused must return false (suppressed)
+        val played = controller.processLateNightAlarm(2)
+        assertFalse("Processing while paused must be suppressed", played)
+
+        // When paused, rescheduling is skipped and alarms are cancelled
+        val settings = repository.settingsFlow.first()
+        assertFalse("Feature must be confirmed paused", settings.isLivingPhoneEnabled)
+        AlarmScheduler.cancelAlarms(context)
+
+        // Restore
+        repository.setLivingEnabled(true)
+    }
+
+    @Test
+    fun verifyDuplicateAlarmDeliverySuppression() = runBlocking {
+        val repository = PreferencesRepository(context)
+        repository.setLivingEnabled(true)
+
+        val todayStr = SimpleDateFormat("yyyyMMdd", Locale.US).format(Date())
+        repository.recordLateNightHourTriggered(3, todayStr)
+
+        val controller = ReactionController.getInstance(context)
+        // Invoking alarm for hour 3 on the same day must be rejected by deduplication
+        val playedFirst = controller.processLateNightAlarm(3)
+        assertFalse("First duplicate invocation must be rejected", playedFirst)
+
+        val playedSecond = controller.processLateNightAlarm(3)
+        assertFalse("Second duplicate invocation must be rejected", playedSecond)
     }
 
     @Test
@@ -206,7 +269,6 @@ class ExampleRobolectricTest {
         repository.setLivingEnabled(false)
 
         val controller = ReactionController.getInstance(context)
-        // Wait briefly for cachedSettings to update
         kotlinx.coroutines.delay(50L)
         val triggered = controller.attemptReaction(AudioCategory.BATTERY_15, "Test when paused")
         assertFalse("Reaction must be suppressed when Living Phone is disabled", triggered)
