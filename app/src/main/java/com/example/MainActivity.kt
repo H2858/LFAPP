@@ -23,6 +23,7 @@ import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Modifier
 import androidx.core.content.ContextCompat
+import com.example.service.LivingPhoneService
 import com.example.ui.AppScreen
 import com.example.ui.MainViewModel
 import com.example.ui.screens.HomeScreen
@@ -43,6 +44,15 @@ class MainActivity : ComponentActivity() {
 
                 val settings by viewModel.settings.collectAsState()
                 val currentScreen by viewModel.currentScreen.collectAsState()
+
+                // Start or stop background service based on master living switch
+                LaunchedEffect(settings.isLivingPhoneEnabled) {
+                    if (settings.isLivingPhoneEnabled) {
+                        LivingPhoneService.start(this@MainActivity)
+                    } else {
+                        LivingPhoneService.stop(this@MainActivity)
+                    }
+                }
 
                 Box(
                     modifier = Modifier
