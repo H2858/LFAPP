@@ -8,7 +8,8 @@ import android.util.Log
 
 class LivingPhoneAlarmReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
-        Log.i("LivingPhone_Alarm", "Late night alarm received: ${intent.action}")
+        val scheduledHour = intent.getIntExtra(AlarmScheduler.EXTRA_SCHEDULED_HOUR, -1)
+        Log.i("LivingPhone_Alarm", "Late night alarm received for scheduled hour: $scheduledHour")
 
         val powerManager = context.getSystemService(Context.POWER_SERVICE) as? PowerManager
         val wakeLock = powerManager?.newWakeLock(
@@ -17,9 +18,10 @@ class LivingPhoneAlarmReceiver : BroadcastReceiver() {
         )
 
         try {
-            wakeLock?.acquire(8000L) // Safe 8s wake lock while evaluating audio clip
+            wakeLock?.acquire(6000L) // Safe 6s wake lock while evaluating audio clip
 
-            ReactionController.getInstance(context).onLateNightCheck()
+            val targetHour = if (scheduledHour in 0..4) scheduledHour else null
+            ReactionController.getInstance(context).onLateNightCheck(targetHour)
             AlarmScheduler.scheduleNextLateNightAlarm(context)
         } catch (e: Exception) {
             Log.e("LivingPhone_Alarm", "Error handling alarm: ${e.message}")

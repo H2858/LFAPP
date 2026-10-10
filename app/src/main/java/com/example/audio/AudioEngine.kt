@@ -1,7 +1,6 @@
 package com.example.audio
 
 import android.content.Context
-import android.content.res.AssetFileDescriptor
 import android.media.AudioAttributes
 import android.media.AudioFocusRequest
 import android.media.AudioManager
@@ -28,6 +27,9 @@ class AudioEngine(private val context: Context) {
     private val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
     private var mediaPlayer: MediaPlayer? = null
     private val playerLock = Any()
+
+    // Concurrency guard to prevent race conditions during prepareAsync
+    private var isBusyPlayingOrPreparing = false
 
     private var audioFocusRequest: AudioFocusRequest? = null
 
@@ -90,71 +92,95 @@ class AudioEngine(private val context: Context) {
 
     /**
      * Plays a specific asset file with audio focus and single-playback concurrency.
+     * Safely closes AssetFileDescriptor immediately after setting data source.
      */
     fun playAssetFile(assetPath: String, category: AudioCategory): AudioPlayResult {
         synchronized(playerLock) {
-            if (mediaPlayer?.isPlaying == true) {
-                Log.d(tag, "Playback busy, another voice clip is currently playing: ${_currentPlayingClip.value}")
+            if (isBusyPlayingOrPreparing || mediaPlayer?.isPlaying == true) {
+                Log.d(tag, "Playback busy, another clip is currently active: ${_currentPlayingClip.value}")
                 return AudioPlayResult.Busy(_currentPlayingClip.value ?: "unknown")
             }
 
             // Request Audio Focus
             val focusGranted = requestAudioFocus()
             if (!focusGranted) {
-                Log.w(tag, "Audio focus request rejected")
+                Log.w(tag, "Audio focus request rejected by system")
                 return AudioPlayResult.Error("Audio focus rejected by system")
             }
 
-            var afd: AssetFileDescriptor? = null
+            // Mark engine as busy immediately to prevent race conditions during asynchronous preparation
+            isBusyPlayingOrPreparing = true
+            _currentPlayingClip.value = assetPath
+
             try {
                 releasePlayerInternal()
 
-                afd = context.assets.openFd(assetPath)
-                val player = MediaPlayer().apply {
-                    setAudioAttributes(
-                        AudioAttributes.Builder()
-                            .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
-                            .setUsage(AudioAttributes.USAGE_ASSISTANCE_SONIFICATION)
-                            .build()
-                    )
-                    setDataSource(afd.fileDescriptor, afd.startOffset, afd.length)
-                    setOnPreparedListener { mp ->
-                        mp.start()
-                        _isPlaying.value = true
-                        _currentPlayingClip.value = assetPath
-                    }
-                    setOnCompletionListener {
-                        stopPlayback()
-                    }
-                    setOnErrorListener { _, what, extra ->
-                        Log.e(tag, "MediaPlayer error: what=$what, extra=$extra for $assetPath")
-                        stopPlayback()
-                        true
-                    }
-                    prepareAsync()
+                val player = MediaPlayer()
+                player.setAudioAttributes(
+                    AudioAttributes.Builder()
+                        .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                        .setUsage(AudioAttributes.USAGE_ASSISTANCE_SONIFICATION)
+                        .build()
+                )
+
+                // Safely open and close AssetFileDescriptor using scoped .use block
+                context.assets.openFd(assetPath).use { afd ->
+                    player.setDataSource(afd.fileDescriptor, afd.startOffset, afd.length)
                 }
+
+                player.setOnPreparedListener { mp ->
+                    synchronized(playerLock) {
+                        try {
+                            mp.start()
+                            _isPlaying.value = true
+                        } catch (e: Exception) {
+                            Log.e(tag, "Error starting MediaPlayer on prepare: ${e.message}")
+                            stopPlayback()
+                        }
+                    }
+                }
+
+                player.setOnCompletionListener {
+                    stopPlayback()
+                }
+
+                player.setOnErrorListener { _, what, extra ->
+                    Log.e(tag, "MediaPlayer error: what=$what, extra=$extra for $assetPath")
+                    stopPlayback()
+                    true
+                }
+
                 mediaPlayer = player
+                player.prepareAsync()
                 return AudioPlayResult.Success(assetPath, category)
             } catch (e: IOException) {
-                Log.e(tag, "Failed to open or prepare asset: $assetPath", e)
-                abandonAudioFocus()
-                return AudioPlayResult.Error("IO Exception opening $assetPath: ${e.message}")
+                Log.e(tag, "Failed to open or decode asset: $assetPath", e)
+                cleanupFailedAttempt()
+                return AudioPlayResult.Error("IO error reading $assetPath: ${e.message}")
             } catch (e: Exception) {
-                Log.e(tag, "Unexpected error playing asset: $assetPath", e)
-                abandonAudioFocus()
-                return AudioPlayResult.Error("Error: ${e.message}")
-            } finally {
-                // Note: FileDescriptor must NOT be closed before MediaPlayer is prepared/playing
-                // closing afd here is safe only if we duplicate, but closing afd immediately closes fd.
-                // AssetFileDescriptor will be closed when player completes or errors.
+                Log.e(tag, "Unexpected error initializing playback for: $assetPath", e)
+                cleanupFailedAttempt()
+                return AudioPlayResult.Error("Playback initialization failed: ${e.message}")
             }
         }
     }
 
+    private fun cleanupFailedAttempt() {
+        releasePlayerInternal()
+        abandonAudioFocus()
+        isBusyPlayingOrPreparing = false
+        _isPlaying.value = false
+        _currentPlayingClip.value = null
+    }
+
+    /**
+     * Safely and idempotently stops playback and releases all resources.
+     */
     fun stopPlayback() {
         synchronized(playerLock) {
             releasePlayerInternal()
             abandonAudioFocus()
+            isBusyPlayingOrPreparing = false
             _isPlaying.value = false
             _currentPlayingClip.value = null
         }
@@ -177,25 +203,30 @@ class AudioEngine(private val context: Context) {
     }
 
     private fun requestAudioFocus(): Boolean {
-        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val req = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK)
-                .setAudioAttributes(
-                    AudioAttributes.Builder()
-                        .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
-                        .setUsage(AudioAttributes.USAGE_ASSISTANCE_SONIFICATION)
-                        .build()
-                )
-                .setOnAudioFocusChangeListener(focusChangeListener)
-                .build()
-            audioFocusRequest = req
-            audioManager.requestAudioFocus(req) == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
-        } else {
-            @Suppress("DEPRECATION")
-            audioManager.requestAudioFocus(
-                focusChangeListener,
-                AudioManager.STREAM_NOTIFICATION,
-                AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK
-            ) == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
+        return try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                val req = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK)
+                    .setAudioAttributes(
+                        AudioAttributes.Builder()
+                            .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                            .setUsage(AudioAttributes.USAGE_ASSISTANCE_SONIFICATION)
+                            .build()
+                    )
+                    .setOnAudioFocusChangeListener(focusChangeListener)
+                    .build()
+                audioFocusRequest = req
+                audioManager.requestAudioFocus(req) == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
+            } else {
+                @Suppress("DEPRECATION")
+                audioManager.requestAudioFocus(
+                    focusChangeListener,
+                    AudioManager.STREAM_NOTIFICATION,
+                    AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK
+                ) == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
+            }
+        } catch (e: Exception) {
+            Log.w(tag, "Failed to request audio focus: ${e.message}")
+            false
         }
     }
 

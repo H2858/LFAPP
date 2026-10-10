@@ -20,7 +20,7 @@ class LivingPhonePowerReceiver : BroadcastReceiver() {
         )
 
         try {
-            wakeLock?.acquire(6000L)
+            wakeLock?.acquire(5000L)
             val controller = ReactionController.getInstance(context)
 
             when (action) {
@@ -31,7 +31,6 @@ class LivingPhonePowerReceiver : BroadcastReceiver() {
                     controller.onChargingChanged(false)
                 }
                 Intent.ACTION_BATTERY_LOW -> {
-                    // Check actual percentage if available via sticky battery intent
                     val batteryIntent = context.registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED))
                     val level = batteryIntent?.getIntExtra(BatteryManager.EXTRA_LEVEL, -1) ?: -1
                     val scale = batteryIntent?.getIntExtra(BatteryManager.EXTRA_SCALE, -1) ?: -1
@@ -49,7 +48,7 @@ class LivingPhonePowerReceiver : BroadcastReceiver() {
                 }
             }
         } catch (e: Exception) {
-            Log.e("LivingPhone_Power", "Error handling broadcast: ${e.message}")
+            Log.e("LivingPhone_Power", "Error handling power broadcast: ${e.message}")
         } finally {
             if (wakeLock?.isHeld == true) {
                 try {

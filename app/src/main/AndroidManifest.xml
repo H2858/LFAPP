@@ -9,7 +9,6 @@
     <uses-permission android:name="android.permission.WAKE_LOCK" />
     <uses-permission android:name="android.permission.VIBRATE" />
     <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
-    <uses-permission android:name="android.permission.USE_EXACT_ALARM" />
 
     <application
         android:allowBackup="true"
@@ -43,7 +42,7 @@
                 android:value="Living Phone ambient event monitoring and responsive audio playback" />
         </service>
 
-        <!-- Boot Receiver to reschedule alarms & restore ambient state -->
+        <!-- Boot & Time-Change Receiver to reschedule alarms & restore state -->
         <receiver
             android:name=".service.LivingPhoneBootReceiver"
             android:enabled="true"
@@ -51,6 +50,8 @@
             <intent-filter>
                 <action android:name="android.intent.action.BOOT_COMPLETED" />
                 <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+                <action android:name="android.intent.action.TIME_SET" />
+                <action android:name="android.intent.action.TIMEZONE_CHANGED" />
                 <category android:name="android.intent.category.DEFAULT" />
             </intent-filter>
         </receiver>

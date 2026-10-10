@@ -9,6 +9,7 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.content.pm.ServiceInfo
 import android.hardware.Sensor
 import android.hardware.SensorEvent
 import android.hardware.SensorEventListener
@@ -35,32 +36,38 @@ class LivingPhoneService : Service(), SensorEventListener {
     private var sensorManager: SensorManager? = null
     private var lightSensor: Sensor? = null
     private var accelerometer: Sensor? = null
+    private var isSensorsRegistered = false
 
-    // Ambient light state
-    private var lastLux: Float = -1f
-    private var wasDark = false
-    private var darkEnterTimestamp = 0L
+    // Ambient light debounce state
+    private var darkCandidateTimestamp = 0L
+    private var wasConfirmedDark = false
+    private var darkConfirmedTimestamp = 0L
 
-    // Motion state
-    private var lastMotionCheckTime = 0L
+    // Accelerometer motion state
+    private var lastMotionEvaluationTime = 0L
     private var motionActivityCounter = 0
 
-    // Dynamic battery receiver
-    private val batteryReceiver = object : BroadcastReceiver() {
+    // Dynamic battery and system event receiver
+    private val systemReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
-            val action = intent.action ?: return
-            if (action == Intent.ACTION_BATTERY_CHANGED) {
-                val level = intent.getIntExtra(BatteryManager.EXTRA_LEVEL, -1)
-                val scale = intent.getIntExtra(BatteryManager.EXTRA_SCALE, -1)
-                if (level >= 0 && scale > 0) {
-                    val pct = (level * 100) / scale
-                    controller.onBatteryChanged(pct)
-                }
+            when (intent.action) {
+                Intent.ACTION_BATTERY_CHANGED -> {
+                    val level = intent.getIntExtra(BatteryManager.EXTRA_LEVEL, -1)
+                    val scale = intent.getIntExtra(BatteryManager.EXTRA_SCALE, -1)
+                    if (level >= 0 && scale > 0) {
+                        val pct = (level * 100) / scale
+                        controller.onBatteryChanged(pct)
+                    }
 
-                val status = intent.getIntExtra(BatteryManager.EXTRA_STATUS, -1)
-                val isCharging = status == BatteryManager.BATTERY_STATUS_CHARGING ||
-                        status == BatteryManager.BATTERY_STATUS_FULL
-                controller.onChargingChanged(isCharging)
+                    val status = intent.getIntExtra(BatteryManager.EXTRA_STATUS, -1)
+                    val isCharging = status == BatteryManager.BATTERY_STATUS_CHARGING ||
+                            status == BatteryManager.BATTERY_STATUS_FULL
+                    controller.onChargingChanged(isCharging)
+                }
+                Intent.ACTION_USER_PRESENT -> {
+                    Log.d(tag, "Device unlocked by user: triggering usage reaction check")
+                    controller.onUserPresent()
+                }
             }
         }
     }
@@ -77,10 +84,14 @@ class LivingPhoneService : Service(), SensorEventListener {
             val intent = Intent(context, LivingPhoneService::class.java).apply {
                 putExtra(EXTRA_COMMAND, COMMAND_START)
             }
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                context.startForegroundService(intent)
-            } else {
-                context.startService(intent)
+            try {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    context.startForegroundService(intent)
+                } else {
+                    context.startService(intent)
+                }
+            } catch (e: Exception) {
+                Log.e("LivingPhoneService", "Failed to start service: ${e.message}")
             }
         }
 
@@ -88,7 +99,11 @@ class LivingPhoneService : Service(), SensorEventListener {
             val intent = Intent(context, LivingPhoneService::class.java).apply {
                 putExtra(EXTRA_COMMAND, COMMAND_STOP)
             }
-            context.startService(intent)
+            try {
+                context.startService(intent)
+            } catch (e: Exception) {
+                Log.e("LivingPhoneService", "Failed to stop service: ${e.message}")
+            }
         }
     }
 
@@ -99,26 +114,52 @@ class LivingPhoneService : Service(), SensorEventListener {
 
         createNotificationChannel()
         val notification = buildForegroundNotification()
-        startForeground(NOTIFICATION_ID, notification)
 
-        // Register dynamic battery updates
-        val filter = IntentFilter(Intent.ACTION_BATTERY_CHANGED)
-        registerReceiver(batteryReceiver, filter)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            startForeground(
+                NOTIFICATION_ID,
+                notification,
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
+            )
+        } else {
+            startForeground(NOTIFICATION_ID, notification)
+        }
 
-        // Initialize hardware sensors
+        // Register dynamic battery updates and user present / unlock broadcast
+        val filter = IntentFilter().apply {
+            addAction(Intent.ACTION_BATTERY_CHANGED)
+            addAction(Intent.ACTION_USER_PRESENT)
+        }
+        registerReceiver(systemReceiver, filter)
+
+        // Initialize hardware sensors with battery-friendly sampling rates
         sensorManager = getSystemService(Context.SENSOR_SERVICE) as? SensorManager
         lightSensor = sensorManager?.getDefaultSensor(Sensor.TYPE_LIGHT)
         accelerometer = sensorManager?.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
 
+        registerSensors()
+
+        // Schedule late night alarm checks
+        AlarmScheduler.scheduleNextLateNightAlarm(this)
+    }
+
+    private fun registerSensors() {
+        if (isSensorsRegistered) return
         lightSensor?.let {
             sensorManager?.registerListener(this, it, SensorManager.SENSOR_DELAY_NORMAL)
         }
         accelerometer?.let {
-            sensorManager?.registerListener(this, it, SensorManager.SENSOR_DELAY_UI)
+            sensorManager?.registerListener(this, it, SensorManager.SENSOR_DELAY_NORMAL)
         }
+        isSensorsRegistered = true
+    }
 
-        // Schedule late night alarm checks
-        AlarmScheduler.scheduleNextLateNightAlarm(this)
+    private fun unregisterSensors() {
+        if (!isSensorsRegistered) return
+        try {
+            sensorManager?.unregisterListener(this)
+        } catch (_: Exception) {}
+        isSensorsRegistered = false
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -136,13 +177,10 @@ class LivingPhoneService : Service(), SensorEventListener {
         super.onDestroy()
         Log.i(tag, "LivingPhoneService onDestroy")
         try {
-            unregisterReceiver(batteryReceiver)
+            unregisterReceiver(systemReceiver)
         } catch (_: Exception) {}
 
-        try {
-            sensorManager?.unregisterListener(this)
-        } catch (_: Exception) {}
-
+        unregisterSensors()
         serviceScope.cancel()
     }
 
@@ -150,30 +188,38 @@ class LivingPhoneService : Service(), SensorEventListener {
 
     // SensorEventListener
     override fun onSensorChanged(event: SensorEvent) {
+        val now = System.currentTimeMillis()
+
         when (event.sensor.type) {
             Sensor.TYPE_LIGHT -> {
                 val lux = event.values[0]
-                val now = System.currentTimeMillis()
 
                 if (lux < 2.5f) {
-                    // Entered darkness (e.g. pocket or bag)
-                    if (!wasDark) {
-                        wasDark = true
-                        darkEnterTimestamp = now
-                        // Pocket dark reaction
-                        controller.attemptReaction(AudioCategory.POCKET_DARK, "Entered Dark/Pocket")
+                    // Sensor reads dark. Check if sustained to avoid transient shadow false positives
+                    if (!wasConfirmedDark) {
+                        if (darkCandidateTimestamp == 0L) {
+                            darkCandidateTimestamp = now
+                        } else if (now - darkCandidateTimestamp >= 2500L) {
+                            // Remained dark for >= 2.5 seconds: confirm pocket dark
+                            wasConfirmedDark = true
+                            darkConfirmedTimestamp = now
+                            controller.attemptReaction(AudioCategory.POCKET_DARK, "Sustained Darkness / Pocket")
+                        }
                     }
-                } else if (lux > 35.0f) {
-                    // Transitioned to bright light from darkness
-                    if (wasDark && (now - darkEnterTimestamp > 3_000L)) {
-                        wasDark = false
-                        // Pocket light reaction
-                        controller.attemptReaction(AudioCategory.POCKET_LIGHT, "Exited Pocket to Light")
-                    } else {
-                        wasDark = false
+                } else {
+                    // Sensor reads light (>= 2.5f)
+                    darkCandidateTimestamp = 0L
+
+                    if (lux > 35.0f && wasConfirmedDark) {
+                        // Exited sustained darkness into bright light
+                        if (now - darkConfirmedTimestamp >= 3000L) {
+                            wasConfirmedDark = false
+                            controller.attemptReaction(AudioCategory.POCKET_LIGHT, "Exited Pocket to Light")
+                        } else {
+                            wasConfirmedDark = false
+                        }
                     }
                 }
-                lastLux = lux
             }
 
             Sensor.TYPE_ACCELEROMETER -> {
@@ -182,19 +228,19 @@ class LivingPhoneService : Service(), SensorEventListener {
                 val z = event.values[2]
                 val gForce = sqrt((x * x + y * y + z * z).toDouble()).toFloat() / SensorManager.GRAVITY_EARTH
 
-                val now = System.currentTimeMillis()
-                if (gForce > 1.4f || gForce < 0.6f) {
+                // Detect motion deviation from 1G gravity
+                if (gForce > 1.35f || gForce < 0.65f) {
                     motionActivityCounter++
                 }
 
-                // Periodic check every 15 seconds
-                if (now - lastMotionCheckTime > 15_000L) {
-                    lastMotionCheckTime = now
-                    if (motionActivityCounter > 18) {
+                // Periodic evaluation every 15 seconds
+                if (now - lastMotionEvaluationTime > 15_000L) {
+                    lastMotionEvaluationTime = now
+                    if (motionActivityCounter > 16) {
                         // High sustained movement -> Exercise
                         controller.attemptReaction(AudioCategory.EXERCISE, "Sustained Physical Movement")
-                    } else if (motionActivityCounter > 4) {
-                        // Light movement -> Motion
+                    } else if (motionActivityCounter > 3) {
+                        // Modest movement -> Motion
                         controller.attemptReaction(AudioCategory.MOTION, "Device Motion")
                     }
                     motionActivityCounter = 0

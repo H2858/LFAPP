@@ -12,16 +12,22 @@ object AlarmScheduler {
     private const val TAG = "AlarmScheduler"
     private const val ALARM_REQUEST_CODE = 9021
 
+    const val EXTRA_SCHEDULED_HOUR = "extra_scheduled_hour"
+    const val EXTRA_SCHEDULED_TIME_MILLIS = "extra_scheduled_time_millis"
+
     /**
-     * Schedules the next exact alarm for one of the target late-night hours:
+     * Schedules the next alarm for one of the target late-night hours:
      * 00:00 (Midnight), 01:00, 02:00, 03:00, or 04:00 AM.
+     * Uses exact alarms when permitted by Android, with graceful fallback.
      */
     fun scheduleNextLateNightAlarm(context: Context) {
         val alarmManager = context.getSystemService(Context.ALARM_SERVICE) as? AlarmManager ?: return
-        val nextTimeMillis = calculateNextLateNightTimeMillis()
+        val (nextTargetHour, nextTimeMillis) = calculateNextLateNightTime()
 
         val intent = Intent(context, LivingPhoneAlarmReceiver::class.java).apply {
             action = "com.example.livingphone.ALARM_LATE_NIGHT"
+            putExtra(EXTRA_SCHEDULED_HOUR, nextTargetHour)
+            putExtra(EXTRA_SCHEDULED_TIME_MILLIS, nextTimeMillis)
         }
 
         val pendingIntent = PendingIntent.getBroadcast(
@@ -40,6 +46,7 @@ object AlarmScheduler {
                         pendingIntent
                     )
                 } else {
+                    Log.w(TAG, "Exact alarm permission not granted. Falling back to setAndAllowWhileIdle.")
                     alarmManager.setAndAllowWhileIdle(
                         AlarmManager.RTC_WAKEUP,
                         nextTimeMillis,
@@ -53,7 +60,7 @@ object AlarmScheduler {
                     pendingIntent
                 )
             }
-            Log.d(TAG, "Next late night alarm scheduled for: ${java.util.Date(nextTimeMillis)}")
+            Log.d(TAG, "Late night alarm for hour $nextTargetHour scheduled at: ${java.util.Date(nextTimeMillis)}")
         } catch (e: Exception) {
             Log.e(TAG, "Failed to schedule late night alarm: ${e.message}")
         }
@@ -73,11 +80,14 @@ object AlarmScheduler {
         alarmManager.cancel(pendingIntent)
     }
 
-    private fun calculateNextLateNightTimeMillis(): Long {
+    /**
+     * Calculates the next upcoming target hour (0, 1, 2, 3, or 4) and its timestamp in millis.
+     */
+    private fun calculateNextLateNightTime(): Pair<Int, Long> {
         val now = Calendar.getInstance()
         val targetHours = listOf(0, 1, 2, 3, 4)
 
-        // Find the earliest upcoming hour today or tomorrow
+        // Find the earliest upcoming hour today
         for (hour in targetHours) {
             val candidate = Calendar.getInstance().apply {
                 set(Calendar.HOUR_OF_DAY, hour)
@@ -86,17 +96,18 @@ object AlarmScheduler {
                 set(Calendar.MILLISECOND, 0)
             }
             if (candidate.timeInMillis > now.timeInMillis + 10_000L) { // at least 10s in future
-                return candidate.timeInMillis
+                return Pair(hour, candidate.timeInMillis)
             }
         }
 
-        // None left today, schedule midnight tomorrow
-        return Calendar.getInstance().apply {
+        // None left today, schedule midnight (hour 0) tomorrow
+        val tomorrowMidnight = Calendar.getInstance().apply {
             add(Calendar.DAY_OF_YEAR, 1)
             set(Calendar.HOUR_OF_DAY, 0)
             set(Calendar.MINUTE, 0)
             set(Calendar.SECOND, 0)
             set(Calendar.MILLISECOND, 0)
-        }.timeInMillis
+        }
+        return Pair(0, tomorrowMidnight.timeInMillis)
     }
 }

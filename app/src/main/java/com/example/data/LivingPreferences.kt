@@ -9,6 +9,7 @@ import androidx.datastore.preferences.core.longPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
 
 val Context.dataStore: DataStore<Preferences> by preferencesDataStore(name = "living_phone_settings")
@@ -66,6 +67,8 @@ class PreferencesRepository(private val context: Context) {
         val LAST_REACTION_TIME = longPreferencesKey("last_reaction_time")
         val LAST_REACTION_CATEGORY = stringPreferencesKey("last_reaction_category")
         val LAST_REACTION_CLIP = stringPreferencesKey("last_reaction_clip")
+
+        fun lateNightKey(hour: Int) = stringPreferencesKey("late_night_hour_${hour}_date")
     }
 
     val settingsFlow: Flow<LivingSettings> = context.dataStore.data.map { prefs ->
@@ -109,6 +112,17 @@ class PreferencesRepository(private val context: Context) {
             prefs[Keys.LAST_REACTION_TIME] = System.currentTimeMillis()
             prefs[Keys.LAST_REACTION_CATEGORY] = category
             prefs[Keys.LAST_REACTION_CLIP] = clipPath
+        }
+    }
+
+    suspend fun getLastLateNightDate(hour: Int): String? {
+        val prefs = context.dataStore.data.first()
+        return prefs[Keys.lateNightKey(hour)]
+    }
+
+    suspend fun recordLateNightHourTriggered(hour: Int, dateStr: String) {
+        context.dataStore.edit { prefs ->
+            prefs[Keys.lateNightKey(hour)] = dateStr
         }
     }
 }
